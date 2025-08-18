@@ -95,7 +95,7 @@ sudo apt-get install ffmpeg
 
 ### 运行程序
 ```bash
-python 本体.py
+python hanime1下载器.py
 ```
 
 程序会自动：
