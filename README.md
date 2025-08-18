@@ -15,7 +15,7 @@
 煮波在下载 hanime1 视频时觉得手动操作太麻烦，  
 翻遍 GitHub 发现同类项目基本都失效了，  
 于是决定借助 AI 的力量写了这个下载器。  
-
+<img width="3072" height="1601" alt="image" src="https://github.com/user-attachments/assets/1e6e6846-3378-4501-8aee-387ffb868fbd" />
 虽然工具很简陋，但能用就行 ✔️。  
 You just need to install dependencies and run the Python script.
 
