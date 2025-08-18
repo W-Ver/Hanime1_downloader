@@ -2,7 +2,7 @@
 
 # Hanime1_-  
 一款基于 Python 的 hanime1 批量下载工具 / A Python-based hanime1 batch downloader (99.9% powered by Claude)
-
+新人GitHub999%文本by Claude
 ---
 
 # 🎬 视频智能下载器
@@ -53,8 +53,8 @@
 
 ### 1. 克隆项目
 ```bash
-git clone https://github.com/yourusername/video-downloader.git
-cd video-downloader
+git clone https://github.com/W-Ver/Hanime1_-.git
+cd Hanime1_-
 ````
 
 ### 2. 安装依赖
