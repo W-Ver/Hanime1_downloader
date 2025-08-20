@@ -1,174 +1,235 @@
-# 🎬 Hanime1 Downloader
-
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://github.com)
-
-> 🚀 一个 **基于 Python 的 hanime1 批量下载工具**，支持系列识别、防风控下载、自动重试，配备毛玻璃风格 UI。  
-> A **Python-based hanime1 batch downloader**, featuring series recognition, anti-blocking, auto-retry, and glassmorphism UI.  
-> (99.9% powered by Claude 🤖)
 
 ---
 
-## 🌟 背景 / Background
+# Hanime1 CLI · 交互式多线程高颜值版（V2）
 
-煮波在下载 hanime1 视频时觉得手动操作太麻烦，  
-翻遍 GitHub 发现同类项目基本都失效了，  
-于是决定借助 AI 的力量写了这个下载器。  
-<img width="3072" height="1601" alt="image" src="https://github.com/user-attachments/assets/1e6e6846-3378-4501-8aee-387ffb868fbd" />
-虽然工具很简陋，但能用就行 ✔️。  
-You just need to install dependencies and run the Python script.
+> 一个基于 Python 的 hanime1 批量下载器：**交互式菜单 / 多线程 / 高颜值终端 UI / 原名抓取强化 / 懒加载全量抓取 / 智能冲突处理**。
+> 仅用于学习研究，请遵守目标站点 ToS 及当地法律法规。
 
----
+## ✨ 亮点特性（V2 新增）
 
-## ✨ 功能特性 / Features
+* **一键交互菜单**：先列出**所有操作选项**（解析、下载当前/同系列/整列、读取 plan.json、设置、退出），支持**一行速用**：`4 https://hanime1.me/watch?v=123456`
+* **多线程下载**：并行任务 + 错峰提交 + 可调延迟；配合**智能重试**，更稳更快
+* **全量链接抓取**：**先把播放列表所有 `watch?v=xxxxx` 链接抓全**（滚动触发懒加载），再逐个进入**按原名**下载
+* **标题统一**：标题一律从 `#shareBtn-title` 中取“原名”；解析失败再降级到 `og:title / <title>`
+* **系列名/同系列识别**：自动标记同系列，支持只下同系列或整列
+* **文件冲突友好**：同名文件**询问跳过/覆盖**；**10s 无操作默认跳过**；**跳过后自动继续下一个**
+* **高颜值 CLI**：基于 `rich` 的全局/文件双进度，转速、ETA、速度、漂亮的表格/面板
+* **Selenium 4 适配**：不再使用 `desired_capabilities`；统一用 `options.set_capability(...)`
+* **抗风控**：自定义延迟、错峰、线程；请求头/UA/无头浏览器；（可选）解析阶段加载图片
+* **传统子命令仍可用**：`analyze` / `download`，方便脚本化或与计划文件联动
 
-### 🎯 智能识别
-- **系列自动识别**：一键下载同系列视频  
-- **原始标题提取**：自动获取视频原名  
-- **画质优先选择**：自动选择最高可用画质（1080p > 720p > 480p）  
-- **播放列表解析**：支持区分当前视频与系列视频  
-
-### 🛡️ 防风控设计
-- **单线程顺序下载**：降低触发风险  
-- **自定义间隔**：支持 1-30 秒间隔设置  
-- **智能重试**：失败自动重试（最多 5 次）  
-- **静默模式**：后台静音运行  
-
-### 💎 界面设计
-- **毛玻璃 UI**：现代 glassmorphism 风格  
-- **双层进度条**：总进度 + 文件进度分离显示  
-- **实时队列**：直观查看任务列表  
-- **响应式布局**：适配不同分辨率  
-
-### 🔧 高级功能
-- **批量操作**：全选 / 取消 / 系列 / 高清  
-- **自定义配置**：目录 / 重试次数 / 画质策略  
-- **实时统计**：数量 / 系列 / 高清 / 预计大小  
-- **错误恢复**：支持断点续传、失败记录  
+> 参考与承袭自 V1 项目（MIT）：W-Ver/Hanime1\_downloader。([GitHub][1])
 
 ---
 
-## 📦 安装指南 / Installation
+## 目录
 
-### 环境需求
-- Python 3.8+  
-- Chrome 浏览器（最新版）  
-- 操作系统：Windows / macOS / Linux  
+* [安装](#安装)
+* [快速开始](#快速开始)
+* [交互式菜单](#交互式菜单)
+* [一行速用](#一行速用)
+* [传统 CLI 子命令](#传统-cli-子命令)
+* [设置项](#设置项)
+* [命名与抓取策略](#命名与抓取策略)
+* [文件冲突策略](#文件冲突策略)
+* [故障排除](#故障排除)
+* [与 V1 的差异](#与-v1-的差异)
+* [Roadmap](#roadmap)
+* [许可 & 致谢](#许可--致谢)
 
-### 步骤
-1. 克隆项目
-```bash
-git clone https://github.com/W-Ver/Hanime1_downloader.git
-cd Hanime1_downloader
-````
+---
 
-2. 安装依赖
+## 安装
+
+**环境需求**
+
+* Python 3.8+
+* **Chrome** 与匹配版本 **ChromeDriver**（加入 PATH）
+* （推荐）`ffmpeg`：更稳地处理 `.m3u8` 下载
+* 依赖：`requests`、`selenium`、（可选）`rich`
+
+**安装命令**
 
 ```bash
-pip install flask flask-cors selenium requests
+pip install -U requests selenium rich
+# 可选：安装 ffmpeg（Windows 请到官网下载解压后加入 PATH）
 ```
 
-3. 安装 ChromeDriver
-
-   * [下载地址](https://chromedriver.chromium.org/) 并放入 PATH
-   * macOS: `brew install chromedriver`
-   * Linux: `sudo apt-get install chromium-chromedriver`
-
-4. 安装 FFmpeg（处理 m3u8 视频）
-
-   * Windows: [FFmpeg 官网](https://ffmpeg.org/download.html)，解压并加入 PATH
-   * macOS: `brew install ffmpeg`
-   * Linux: `sudo apt-get install ffmpeg`
+> V1 中也依赖 Chrome/ChromeDriver 与 ffmpeg，保持一致。([GitHub][1])
 
 ---
 
-## 🚀 使用方法 / Quick Start
-
-运行程序：
+## 快速开始
 
 ```bash
-python hanime1下载器.py
+# 方式一：进入交互菜单（推荐）
+python hanime1_cli_交互式多线程高颜值版.py
+
+# 方式二：一行速用（无需进入菜单）
+python hanime1_cli_交互式多线程高颜值版.py 4 https://hanime1.me/watch?v=123456
+
+# 方式三：传统子命令
+python hanime1_cli_交互式多线程高颜值版.py analyze "https://hanime1.me/watch?v=123456" --json
+python hanime1_cli_交互式多线程高颜值版.py download --url "https://hanime1.me/watch?v=123456" --all --threads 3
 ```
 
-程序会：
+---
 
-1. 启动本地服务器（端口 5000）
-2. 自动打开浏览器
-3. 显示下载界面
+## 交互式菜单
 
-使用流程：
+运行后会显示一个表格菜单（`rich` 样式）。**你可以输入编号**，或**直接一行速用**（编号+链接/文件路径）：
 
-1. 输入视频链接 (`https://hanime1.me/watch?v=xxxxx`)
-2. 点击 **🔍 分析视频**
-3. 选择视频（全选 / 系列 / 高清 / 手动勾选）
-4. 配置下载参数
-5. 点击 **🚀 开始下载**
+* 1 解析页面（仅查看）：展示标题/系列/画质；可**保存 plan.json**
+* 2 下载当前视频
+* 3 下载同系列
+* 4 下载播放列表全部（**先抓全量链接，再逐个按原名下载**）
+* 5 使用计划文件下载（读取 `plan.json`）
+* 6 设置选项（目录/重试/延迟/错峰/线程/画质/headless/解析图片/标题策略）
+* 7 退出
 
 ---
 
-## ⚙️ 配置说明 / Settings
+## 一行速用
 
-| 设置项   | 默认值                 | 范围     | 说明      |
-| ----- | ------------------- | ------ | ------- |
-| 下载间隔  | 3 秒                 | 1-30 秒 | 防风控延迟时间 |
-| 重试次数  | 3 次                 | 0-5 次  | 自动重试次数  |
-| 画质优先级 | 最高画质                | -      | 下载画质策略  |
-| 下载目录  | \~/Downloads/Videos | -      | 文件保存路径  |
+```bash
+# 下载播放列表全部
+python hanime1_cli_交互式多线程高颜值版.py 4 https://hanime1.me/watch?v=97494
 
-画质策略：
-
-* **最高画质**：1080p > 720p > 480p
-* **平衡模式**：720p > 1080p > 480p
-* **最快速度**：480p > 360p > 720p
+# 用计划文件下载
+python hanime1_cli_交互式多线程高颜值版.py 5 D:\plan.json
+```
 
 ---
 
-## 📝 注意事项 / Notes
+## 传统 CLI 子命令
 
-1. **仅供学习研究**，请合法使用
-2. **禁止商业用途**，尊重版权
-3. **网络需稳定**，否则易中断
-4. **建议设置合理间隔**，避免触发风控
+**analyze**
 
----
+```bash
+python ... analyze "https://hanime1.me/watch?v=123456" --json --save-plan plan.json
+```
 
-## 🛠️ 故障排除 / Troubleshooting
+**download**
 
-* **ffmpeg 未安装**：确认已加入 PATH
-* **ChromeDriver 版本不匹配**：请更新到对应版本
-* **速度慢或失败**：增大间隔，切换画质
-* **无法访问界面**：检查端口 5000 或防火墙设置，手动访问 [http://localhost:5000](http://localhost:5000)
+```bash
+# 下载整列
+python ... download --url "https://hanime1.me/watch?v=123456" --all --threads 3 --retry 3 --delay 2
 
----
+# 仅同系列
+python ... download --url "..." --series-only
 
-## 🤝 贡献 / Contributing
+# 指定编号（来自 analyze 的顺序）
+python ... download --url "..." --ids "1,3,5"
 
-欢迎提交 Issue & PR！
+# 从 plan.json 下载
+python ... download --plan plan.json --all
+```
 
-* 提交 Issue 时请附带日志、环境信息
-* PR 流程：Fork → 新建分支 → 修改 → 提交
+**全局参数（节选）**
 
----
-
-## 📄 开源协议 / License
-
-本项目基于 [MIT License](LICENSE) 开源。
-
----
-
-## 👨‍💻 作者 / Author
-
-* GitHub: [@W-Ver](https://github.com/W-Ver)
+* `--threads` 并发线程数（默认 3）
+* `--stagger` 任务错峰（默认 0.8 秒）
+* `--priority` 画质策略：`highest` / `balanced` / `fastest`
+* `--title-mode` 标题策略：`original`（默认）/ `as_shown`
+* `--headless` / `--no-headless` 启/禁无头
+* `--parse-images` / `--no-parse-images` 解析阶段启/禁图片加载
 
 ---
 
-## 🙏 致谢 / Thanks
+## 设置项
 
-* [Flask](https://flask.palletsprojects.com/)
-* [Selenium](https://www.selenium.dev/)
-* [FFmpeg](https://ffmpeg.org/)
+在菜单 6 中可交互修改并立即生效：
+
+* 下载目录、失败重试、同线程延迟、任务错峰、并发线程
+* 画质优先级（最高/平衡/最快）
+* **标题策略**（`original` 优先从 `#shareBtn-title`、`og:title`、`<title>` 原名抓取；`as_shown` 使用卡片显示名）
+* 无头模式、解析阶段加载图片
 
 ---
 
-⭐ 如果这个项目对你有帮助，别忘了点个 Star！
+## 命名与抓取策略
+
+* **标题来源统一**：优先从页面
+
+  ```html
+  <h3 id="shareBtn-title" class="video-details-wrapper">原名</h3>
+  ```
+
+  获取**原名**；失败则回退到 `og:title` 或 `<title>` 去尾部站点名
+* **播放列表策略**：先滚动列表容器触发懒加载，**把所有 `watch?v=xxxxx` 链接抓全**；然后逐个页**重新解析原名**并下载（避免混入翻译后的卡片名）
+* **同系列识别**：基于原名提取“系列名”进行标记与过滤
+
+---
+
+## 文件冲突策略
+
+* 若目标目录存在同名文件：弹出**覆盖/跳过**选择
+* **10 秒**内无应答默认**跳过**
+* **跳过后自动继续下一个**任务（不会回主菜单中断）
+
+---
+
+## 故障排除
+
+* **`net_error -100` / 证书握手失败**：已启用 `acceptInsecureCerts`、忽略证书参数；若网络波动，可**降低线程**、**增大延迟/错峰**重试
+* **Selenium 报 `WebDriver.__init__() ... desired_capabilities`**：V2 已用 **Selenium 4** 的 `options.set_capability(...)` 适配
+* **Rich 进度条 `unsupported format string passed to NoneType.__format__`**：V2 已改为对未知 total 使用通用占位，不做数值格式化
+* **GPU/WebGL 警告**：已默认 `--disable-gpu`；必要时可在本地自行追加 `--enable-unsafe-swiftshader`
+* **`ffmpeg` 未找到**：请安装并加入 `PATH`（V1 也使用 ffmpeg 处理 m3u8）([GitHub][1])
+* **ChromeDriver 版本不匹配**：请更新与本机 Chrome 一致的版本（V1 README 同样提示）([GitHub][1])
+
+---
+
+## 与 V1 的差异
+
+对比 \[W-Ver/Hanime1\_downloader（V1）]（功能：系列识别、原名提取、画质优先、批量操作、进度 UI、依赖 ChromeDriver 与 ffmpeg 等）([GitHub][1])，V2 主要变化：
+
+* ✅ 交互式菜单 + 一行速用
+* ✅ **多线程** + 错峰 + 延迟 + 智能重试
+* ✅ \*\*统一“原名”\*\*抓取（`#shareBtn-title` → `og:title` → `<title>`）
+* ✅ **先抓全量链接**→再逐个按原名下载（避免标题语言不一致）
+* ✅ **文件冲突** 10s 默认跳过 + 连续下载不中断
+* ✅ 修复 Selenium 4 兼容问题与 Rich 进度条格式化异常
+* ✅ 更加美观的 `rich` 终端 UI
+
+---
+
+## Roadmap
+
+* [ ] 失败任务自动回收与重试队列
+* [ ] 断点续传更精细的 `.mp4` 直传（`Range`/校验）
+* [ ] 站内更多页面结构兼容（移动端/镜像）
+* [ ] 任务导出/导入（CSV/JSON 多格式）
+
+---
+
+## 许可 & 致谢
+
+* **License**：MIT
+* **V1 项目**：W-Ver / Hanime1\_downloader（MIT）— 作为本项目的最初来源与灵感。([GitHub][1])
+
+感谢这些优秀项目/工具：Selenium、FFmpeg、Rich……以及 V1 的思路与脚手架。([GitHub][1])
+
+---
+
+### 附：典型命令速查
+
+```bash
+# 解析并保存计划
+python ... analyze "https://hanime1.me/watch?v=123456" --save-plan plan.json
+
+# 下载整列（多线程）
+python ... download --url "https://hanime1.me/watch?v=123456" --all --threads 3 --retry 3 --delay 2
+
+# 仅下载同系列（按“原名”识别）
+python ... download --url "..." --series-only
+
+# 从计划文件挑选编号下载
+python ... download --plan plan.json --ids "1,3,5"
+```
+
+---
+
+
+[1]: https://github.com/W-Ver/Hanime1_downloader "GitHub - W-Ver/Hanime1_downloader: 一款基于Python的由Claude辅助了999%的hanime1批量下载工具/A Python-based hanime1 batch downloader, 99.9% powered by Claude."
