@@ -1,1811 +1,997 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-视频批量下载器 - 单线程防风控版
+视频批量下载器（交互菜单 · 多线程 · 统一标题= #shareBtn-title · 高颜值 CLI）
+================================================================================
+要点更新：
+  • 所有文件名一律取自 <h3 id="shareBtn-title">…</h3> 的文本（优先 HTTP 直抓）
+  • 播放列表/同系列：先抓全量链接，再逐个按“原名(shareBtn-title)”下载
+  • 进度条修复（不再因 None total 报错）
+  • 文件存在时 10 秒内未答复默认跳过；答 O 覆盖后立即下载下一个
+
+依赖：requests, selenium, rich(推荐), Chrome+chromedriver, ffmpeg(抓 m3u8)
+安装：pip install -U requests selenium rich
+仅限合规用途。
 """
 
-from flask import Flask, request, jsonify, render_template_string
-from flask_cors import CORS
+from __future__ import annotations
+import argparse
+import concurrent.futures as cf
+import contextlib
 import json
-import time
-import re
 import os
+import re
+import shutil
+import signal
 import subprocess
+import sys
 import threading
+import time
+import hashlib
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ====================== 可选高颜值 UI：rich =======================
+RICH = False
+with contextlib.suppress(Exception):
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.prompt import Prompt, Confirm
+    from rich.progress import (
+        Progress, BarColumn, TextColumn,
+        TimeRemainingColumn, TransferSpeedColumn, SpinnerColumn
+    )
+    from rich.theme import Theme
+    RICH = True
+
+if RICH:
+    theme = Theme({
+        "info": "bold cyan",
+        "good": "bold green",
+        "warn": "bold yellow",
+        "bad": "bold red",
+        "hl": "bright_magenta",
+    })
+    console = Console(theme=theme)
+else:
+    class _Dummy:
+        def print(self, *a, **k):
+            print(*a, **k)
+    console = _Dummy()
+
+RESET = "\033[0m"; BOLD = "\033[1m"; GREEN = "\033[32m"; YELLOW = "\033[33m"; RED = "\033[31m"; CYAN = "\033[36m"
+
+def c_info(msg: str) -> None:
+    if RICH: console.print(f"[info][i][/info] {msg}")
+    else: print(f"{CYAN}[i]{RESET} {msg}")
+
+def c_ok(msg: str) -> None:
+    if RICH: console.print(f"[good][✓][/good] {msg}")
+    else: print(f"{GREEN}[✓]{RESET} {msg}")
+
+def c_warn(msg: str) -> None:
+    if RICH: console.print(f"[warn][!][/warn] {msg}")
+    else: print(f"{YELLOW}[!]{RESET} {msg}")
+
+def c_err(msg: str) -> None:
+    if RICH: console.print(f"[bad][x][/bad] {msg}")
+    else: print(f"{RED}[x]{RESET} {msg}")
+
+# ====================== 依赖 =======================
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException
-import requests
-from datetime import datetime
-import hashlib
-import webbrowser
-from threading import Timer
-import tkinter as tk
-from tkinter import filedialog
 
-app = Flask(__name__)
-CORS(app)
-
-# 全局变量
-download_progress = {}
-download_tasks = {}
-download_settings = {
-    'download_delay': 3,
-    'download_dir': str(Path.home() / 'Downloads' / 'Videos'),
-    'retry_count': 3,
-    'quality_priority': ['1080p', '720p', '480p', '360p', '240p']
-}
-
-# HTML模板 - 毛玻璃UI
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>视频下载器 Pro</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        :root {
-            --primary: #6366f1;
-            --primary-dark: #4f46e5;
-            --success: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --glass-bg: rgba(255, 255, 255, 0.1);
-            --glass-border: rgba(255, 255, 255, 0.2);
-            --text-primary: #ffffff;
-            --text-secondary: rgba(255, 255, 255, 0.8);
-            --shadow-xl: 0 20px 40px rgba(0, 0, 0, 0.3);
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            min-height: 100vh;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            position: relative;
-            overflow-x: hidden;
-        }
-
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 320"><path fill="%23ffffff" fill-opacity="0.05" d="M0,192L48,197.3C96,203,192,213,288,229.3C384,245,480,267,576,250.7C672,235,768,181,864,181.3C960,181,1056,235,1152,234.7C1248,235,1344,181,1392,154.7L1440,128L1440,320L1392,320C1344,320,1248,320,1152,320C1056,320,960,320,864,320C768,320,672,320,576,320C480,320,384,320,288,320C192,320,96,320,48,320L0,320Z"></path></svg>') no-repeat bottom;
-            background-size: cover;
-            pointer-events: none;
-            opacity: 0.3;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-            position: relative;
-            z-index: 1;
-        }
-
-        .glass {
-            background: var(--glass-bg);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            border: 1px solid var(--glass-border);
-            border-radius: 16px;
-            box-shadow: var(--shadow-xl);
-        }
-
-        .header {
-            text-align: center;
-            color: var(--text-primary);
-            margin-bottom: 40px;
-            animation: fadeInDown 0.8s ease;
-        }
-
-        @keyframes fadeInDown {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .header h1 {
-            font-size: 3rem;
-            font-weight: 700;
-            margin-bottom: 10px;
-            text-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-            background: linear-gradient(135deg, #fff, #e0e7ff);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .header p {
-            font-size: 1.2rem;
-            color: var(--text-secondary);
-            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-        }
-
-        .card {
-            padding: 30px;
-            margin-bottom: 24px;
-            animation: fadeInUp 0.8s ease;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 30px 60px rgba(0, 0, 0, 0.4);
-        }
-
-        .input-group {
-            display: flex;
-            gap: 16px;
-            margin-bottom: 24px;
-        }
-
-        .input-wrapper {
-            flex: 1;
-            position: relative;
-        }
-
-        .input-wrapper input {
-            width: 100%;
-            padding: 14px 20px;
-            background: rgba(255, 255, 255, 0.9);
-            border: 2px solid transparent;
-            border-radius: 12px;
-            font-size: 16px;
-            transition: all 0.3s ease;
-            color: #333;
-        }
-
-        .input-wrapper input:focus {
-            outline: none;
-            background: white;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
-        }
-
-        .btn {
-            padding: 14px 28px;
-            border: none;
-            border-radius: 12px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .btn::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            transition: left 0.5s;
-        }
-
-        .btn:hover::before {
-            left: 100%;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-            color: white;
-        }
-
-        .btn-success {
-            background: linear-gradient(135deg, var(--success), #059669);
-            color: white;
-        }
-
-        .btn-warning {
-            background: linear-gradient(135deg, var(--warning), #d97706);
-            color: white;
-        }
-
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
-        }
-
-        .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none !important;
-        }
-
-        .settings-panel {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 24px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 12px;
-        }
-
-        .setting-item {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .setting-label {
-            color: var(--text-secondary);
-            font-size: 14px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .setting-control {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .setting-control input[type="number"],
-        .setting-control select {
-            padding: 8px 12px;
-            background: rgba(255, 255, 255, 0.9);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            border-radius: 8px;
-            color: #333;
-            font-size: 14px;
-            flex: 1;
-        }
-
-        .folder-path {
-            padding: 8px 12px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 8px;
-            color: var(--text-primary);
-            font-size: 13px;
-            font-family: monospace;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            flex: 1;
-        }
-
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 20px;
-            margin-bottom: 24px;
-        }
-
-        .stat-item {
-            text-align: center;
-            padding: 20px;
-            background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            transition: all 0.3s ease;
-        }
-
-        .stat-item:hover {
-            transform: translateY(-2px);
-            background: linear-gradient(135deg, rgba(255,255,255,0.15), rgba(255,255,255,0.08));
-        }
-
-        .stat-value {
-            font-size: 32px;
-            font-weight: bold;
-            color: var(--text-primary);
-            margin-bottom: 4px;
-            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-        }
-
-        .stat-label {
-            color: var(--text-secondary);
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .video-list {
-            max-height: 600px;
-            overflow-y: auto;
-            padding: 12px;
-            scrollbar-width: thin;
-            scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
-        }
-
-        .video-list::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        .video-list::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
-        }
-
-        .video-list::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 4px;
-        }
-
-        .video-item {
-            display: flex;
-            align-items: center;
-            padding: 16px;
-            margin-bottom: 12px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            transition: all 0.3s ease;
-            cursor: pointer;
-        }
-
-        .video-item:hover {
-            background: rgba(255, 255, 255, 0.1);
-            transform: translateX(4px);
-            border-color: rgba(255, 255, 255, 0.3);
-        }
-
-        .video-item.current {
-            background: linear-gradient(135deg, rgba(251, 191, 36, 0.2), rgba(245, 158, 11, 0.1));
-            border-color: rgba(251, 191, 36, 0.5);
-        }
-
-        .video-item.same-series {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.1));
-            border-color: rgba(59, 130, 246, 0.5);
-        }
-
-        .video-checkbox {
-            width: 22px;
-            height: 22px;
-            margin-right: 16px;
-            cursor: pointer;
-            accent-color: var(--primary);
-        }
-
-        .video-info {
-            flex: 1;
-            min-width: 0;
-            color: var(--text-primary);
-        }
-
-        .video-title {
-            font-weight: 600;
-            margin-bottom: 4px;
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-
-        .video-url {
-            font-size: 12px;
-            color: var(--text-secondary);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            opacity: 0.8;
-        }
-
-        .video-meta {
-            display: flex;
-            gap: 12px;
-            margin-top: 8px;
-            font-size: 13px;
-            color: var(--text-secondary);
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .badge-current {
-            background: linear-gradient(135deg, rgba(251, 191, 36, 0.3), rgba(245, 158, 11, 0.2));
-            color: #fbbf24;
-            border: 1px solid rgba(251, 191, 36, 0.4);
-        }
-
-        .badge-series {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.3), rgba(37, 99, 235, 0.2));
-            color: #60a5fa;
-            border: 1px solid rgba(59, 130, 246, 0.4);
-        }
-
-        .badge-quality {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.3), rgba(5, 150, 105, 0.2));
-            color: #34d399;
-            border: 1px solid rgba(16, 185, 129, 0.4);
-        }
-
-        .progress-container {
-            margin-top: 24px;
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 40px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 20px;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(135deg, var(--success), #059669);
-            transition: width 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: 600;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .progress-fill::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            100% {
-                left: 100%;
-            }
-        }
-
-        .queue-item {
-            padding: 10px 14px;
-            margin-bottom: 8px;
-            border-radius: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: all 0.3s;
-        }
-        
-        .queue-item.downloading {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.1));
-            border-color: rgba(59, 130, 246, 0.5);
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.8; }
-        }
-        
-        .queue-item.completed {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.1));
-            border-color: rgba(16, 185, 129, 0.3);
-        }
-        
-        .queue-item.failed {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.1));
-            border-color: rgba(239, 68, 68, 0.3);
-        }
-        
-        .queue-item.waiting {
-            opacity: 0.6;
-        }
-
-        .result-item {
-            padding: 14px 18px;
-            margin-bottom: 10px;
-            border-radius: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            animation: slideIn 0.3s ease;
-            color: var(--text-primary);
-        }
-
-        .result-success {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.1));
-            border: 1px solid rgba(16, 185, 129, 0.3);
-        }
-
-        .result-failed {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.1));
-            border: 1px solid rgba(239, 68, 68, 0.3);
-        }
-
-        .actions {
-            display: flex;
-            gap: 12px;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
-        }
-
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 1s ease-in-out infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .status-message {
-            padding: 16px 20px;
-            border-radius: 10px;
-            text-align: center;
-            display: none;
-            margin-top: 16px;
-            font-weight: 500;
-            animation: fadeIn 0.3s ease;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-
-        .status-success {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.1));
-            color: #34d399;
-            border: 1px solid rgba(16, 185, 129, 0.3);
-        }
-
-        .status-error {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.1));
-            color: #f87171;
-            border: 1px solid rgba(239, 68, 68, 0.3);
-        }
-
-        .status-info {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.1));
-            color: #60a5fa;
-            border: 1px solid rgba(59, 130, 246, 0.3);
-        }
-
-        .progress-label {
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        @media (max-width: 768px) {
-            .header h1 {
-                font-size: 2rem;
-            }
-            
-            .input-group {
-                flex-direction: column;
-            }
-            
-            .actions {
-                flex-direction: column;
-            }
-            
-            .actions .btn {
-                width: 100%;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🎬 视频下载器 Pro</h1>
-            <p>单线程防风控 · 智能重试 · 毛玻璃界面</p>
-        </div>
-
-        <div class="card glass">
-            <div class="input-group">
-                <div class="input-wrapper">
-                    <input type="text" id="urlInput" placeholder="输入视频URL (格式: https://hanime1.me/watch?v=xxxxx)" autocomplete="off">
-                </div>
-                <button class="btn btn-primary" onclick="analyzeUrl()" id="analyzeBtn">
-                    <span id="analyzeBtnText">🔍 分析视频</span>
-                    <span class="loading" style="display: none;" id="analyzeLoading"></span>
-                </button>
-            </div>
-            
-            <div class="settings-panel">
-                <div class="setting-item">
-                    <span class="setting-label">下载间隔(秒)</span>
-                    <div class="setting-control">
-                        <input type="number" id="downloadDelay" min="1" max="30" value="3">
-                        <span style="color: var(--text-secondary); font-size: 12px;">防风控</span>
-                    </div>
-                </div>
-                
-                <div class="setting-item">
-                    <span class="setting-label">画质优先级</span>
-                    <div class="setting-control">
-                        <select id="qualityPriority">
-                            <option value="highest">最高画质优先</option>
-                            <option value="balanced">平衡模式</option>
-                            <option value="fastest">最快速度</option>
-                        </select>
-                    </div>
-                </div>
-                
-                <div class="setting-item">
-                    <span class="setting-label">下载目录</span>
-                    <div class="setting-control">
-                        <div class="folder-path" id="downloadPath" title="点击更改">~/Downloads/Videos</div>
-                        <button class="btn btn-warning" onclick="changeDownloadPath()" style="padding: 8px 16px; font-size: 14px;">
-                            📁 更改
-                        </button>
-                    </div>
-                </div>
-                
-                <div class="setting-item">
-                    <span class="setting-label">失败重试</span>
-                    <div class="setting-control">
-                        <input type="number" id="retryCount" min="0" max="5" value="3">
-                        <span style="color: var(--text-secondary); font-size: 12px;">0-5次</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div id="statusMessage"></div>
-        </div>
-
-        <div class="card glass" id="videoInfo" style="display: none;">
-            <h2 style="color: var(--text-primary); margin-bottom: 20px; font-size: 1.5rem;">📊 视频分析结果</h2>
-            
-            <div class="stats">
-                <div class="stat-item">
-                    <div class="stat-value" id="totalVideos">0</div>
-                    <div class="stat-label">总数</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="seriesVideos">0</div>
-                    <div class="stat-label">系列</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="selectedVideos">0</div>
-                    <div class="stat-label">已选</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="highQualityVideos">0</div>
-                    <div class="stat-label">高清</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="estimatedSize">0</div>
-                    <div class="stat-label">预计(GB)</div>
-                </div>
-            </div>
-
-            <div class="actions">
-                <button class="btn btn-primary" onclick="selectAll()">✅ 全选</button>
-                <button class="btn btn-primary" onclick="selectNone()">❌ 取消全选</button>
-                <button class="btn btn-primary" onclick="selectSeries()">📂 选择系列</button>
-                <button class="btn btn-primary" onclick="selectHD()">🎬 选择高清</button>
-                <button class="btn btn-success" onclick="startDownload()" id="downloadBtn">
-                    🚀 开始下载
-                </button>
-            </div>
-
-            <div class="video-list" id="videoList"></div>
-        </div>
-
-        <div class="card glass" id="downloadProgress" style="display: none;">
-            <h2 style="color: var(--text-primary); margin-bottom: 20px; font-size: 1.5rem;">📥 下载进度</h2>
-            
-            <div class="progress-container">
-                <div class="progress-label" style="margin-bottom: 8px; color: var(--text-secondary); font-size: 14px;">
-                    总进度
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill" style="width: 0%">
-                        <span id="progressText">0%</span>
-                    </div>
-                </div>
-                <div style="margin-top: 8px; display: flex; justify-content: space-between; color: var(--text-secondary); font-size: 13px;">
-                    <span id="progressCount">0 / 0</span>
-                    <span id="progressStatus">准备中...</span>
-                    <span id="remainingTime">剩余: --:--</span>
-                </div>
-            </div>
-            
-            <div class="progress-container" style="margin-top: 20px;">
-                <div class="progress-label" style="margin-bottom: 8px; color: var(--text-secondary); font-size: 14px;">
-                    当前文件: <span id="currentFileName" style="color: var(--text-primary);">-</span>
-                </div>
-                <div class="progress-bar" style="height: 30px;">
-                    <div class="progress-fill" id="currentProgressFill" style="width: 0%; background: linear-gradient(135deg, #3b82f6, #2563eb);">
-                        <span id="currentProgressText">0%</span>
-                    </div>
-                </div>
-                <div style="margin-top: 8px; display: flex; justify-content: space-between; color: var(--text-secondary); font-size: 13px;">
-                    <span id="downloadSpeed">速度: 0 MB/s</span>
-                    <span id="downloadSize">0 MB / 0 MB</span>
-                    <span id="retryInfo" style="color: var(--warning);">重试: 0/3</span>
-                </div>
-            </div>
-            
-            <div style="margin-top: 24px;">
-                <h3 style="color: var(--text-primary); margin-bottom: 12px; font-size: 1.1rem;">📋 下载队列</h3>
-                <div id="downloadQueue" style="max-height: 300px; overflow-y: auto;"></div>
-            </div>
-            
-            <div id="downloadResults" style="margin-top: 24px;"></div>
-        </div>
-    </div>
-
-    <script>
-        let currentData = null;
-        let downloadTaskId = null;
-        let settings = {
-            downloadDelay: 3,
-            downloadPath: '~/Downloads/Videos',
-            qualityPriority: 'highest',
-            retryCount: 3
-        };
-
-        function loadSettings() {
-            const saved = localStorage.getItem('downloadSettings');
-            if (saved) {
-                settings = JSON.parse(saved);
-                document.getElementById('downloadDelay').value = settings.downloadDelay || 3;
-                document.getElementById('qualityPriority').value = settings.qualityPriority;
-                document.getElementById('downloadPath').textContent = settings.downloadPath;
-                document.getElementById('retryCount').value = settings.retryCount || 3;
-            }
-        }
-
-        function saveSettings() {
-            settings.downloadDelay = parseInt(document.getElementById('downloadDelay').value);
-            settings.qualityPriority = document.getElementById('qualityPriority').value;
-            settings.retryCount = parseInt(document.getElementById('retryCount').value);
-            localStorage.setItem('downloadSettings', JSON.stringify(settings));
-        }
-
-        async function analyzeUrl() {
-            const url = document.getElementById('urlInput').value.trim();
-            
-            if (!url) {
-                showMessage('请输入视频URL', 'error');
-                return;
-            }
-
-            if (!/https:\\/\\/hanime1\\.me\\/watch\\?v=\\d+/.test(url)) {
-                showMessage('URL格式不正确', 'error');
-                return;
-            }
-
-            const analyzeBtn = document.getElementById('analyzeBtn');
-            const analyzeBtnText = document.getElementById('analyzeBtnText');
-            const analyzeLoading = document.getElementById('analyzeLoading');
-            
-            analyzeBtn.disabled = true;
-            analyzeBtnText.textContent = '分析中...';
-            analyzeLoading.style.display = 'inline-block';
-            
-            showMessage('正在静默分析视频信息...', 'info');
-
-            try {
-                const response = await fetch('/api/analyze', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ 
-                        url,
-                        settings: settings
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error('分析失败');
-                }
-
-                const data = await response.json();
-                currentData = data;
-                
-                displayVideoList(data);
-                showMessage(`✅ 分析完成！找到 ${data.playlist.length} 个视频`, 'success');
-                
-                document.getElementById('videoInfo').style.display = 'block';
-                updateStats();
-                
-            } catch (error) {
-                showMessage('❌ 分析失败: ' + error.message, 'error');
-            } finally {
-                analyzeBtn.disabled = false;
-                analyzeBtnText.textContent = '🔍 分析视频';
-                analyzeLoading.style.display = 'none';
-            }
-        }
-
-        function displayVideoList(data) {
-            const videoList = document.getElementById('videoList');
-            
-            if (!data.playlist || data.playlist.length === 0) {
-                videoList.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-secondary);">未找到视频</div>';
-                return;
-            }
-
-            let html = '';
-            
-            data.playlist.forEach((video, index) => {
-                const classes = ['video-item'];
-                if (video.is_current) classes.push('current');
-                if (video.is_same_series) classes.push('same-series');
-                
-                const badges = [];
-                if (video.is_current) badges.push('<span class="badge badge-current">当前</span>');
-                if (video.is_same_series) badges.push('<span class="badge badge-series">系列</span>');
-                if (video.best_quality === '1080p') badges.push('<span class="badge badge-quality">HD</span>');
-                
-                const size = video.estimated_size || '未知';
-                
-                html += `
-                    <div class="${classes.join(' ')}" onclick="toggleCheckbox('${video.id}')">
-                        <input type="checkbox" class="video-checkbox" 
-                               id="checkbox-${video.id}"
-                               data-video-id="${video.id}"
-                               data-url="${video.url}"
-                               data-title="${video.original_title || video.title}"
-                               data-size="${video.estimated_size || 0}"
-                               ${video.is_same_series ? 'checked' : ''}
-                               onclick="event.stopPropagation()">
-                        <div class="video-info">
-                            <div class="video-title">
-                                ${video.original_title || video.title}
-                                ${badges.join('')}
-                            </div>
-                            <div class="video-url">${video.url}</div>
-                            <div class="video-meta">
-                                <span>📊 画质: ${video.best_quality || '未知'}</span>
-                                <span>💾 大小: ${size} MB</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            });
-            
-            videoList.innerHTML = html;
-            
-            document.querySelectorAll('.video-checkbox').forEach(checkbox => {
-                checkbox.addEventListener('change', updateStats);
-            });
-        }
-
-        function toggleCheckbox(videoId) {
-            const checkbox = document.getElementById(`checkbox-${videoId}`);
-            checkbox.checked = !checkbox.checked;
-            updateStats();
-        }
-
-        function updateStats() {
-            const total = document.querySelectorAll('.video-checkbox').length;
-            const selected = document.querySelectorAll('.video-checkbox:checked').length;
-            const series = document.querySelectorAll('.video-item.same-series').length;
-            const highQuality = currentData ? currentData.playlist.filter(v => v.best_quality === '1080p').length : 0;
-            
-            let totalSize = 0;
-            document.querySelectorAll('.video-checkbox:checked').forEach(cb => {
-                const size = parseFloat(cb.dataset.size) || 0;
-                totalSize += size;
-            });
-            
-            document.getElementById('totalVideos').textContent = total;
-            document.getElementById('seriesVideos').textContent = series;
-            document.getElementById('selectedVideos').textContent = selected;
-            document.getElementById('highQualityVideos').textContent = highQuality;
-            document.getElementById('estimatedSize').textContent = (totalSize / 1024).toFixed(1);
-        }
-
-        function selectAll() {
-            document.querySelectorAll('.video-checkbox').forEach(cb => cb.checked = true);
-            updateStats();
-        }
-
-        function selectNone() {
-            document.querySelectorAll('.video-checkbox').forEach(cb => cb.checked = false);
-            updateStats();
-        }
-
-        function selectSeries() {
-            document.querySelectorAll('.video-checkbox').forEach(cb => {
-                const item = cb.closest('.video-item');
-                cb.checked = item.classList.contains('same-series');
-            });
-            updateStats();
-        }
-
-        function selectHD() {
-            document.querySelectorAll('.video-checkbox').forEach(cb => {
-                cb.checked = false;
-            });
-            currentData.playlist.forEach(video => {
-                if (video.best_quality === '1080p') {
-                    const cb = document.querySelector(`#checkbox-${video.id}`);
-                    if (cb) cb.checked = true;
-                }
-            });
-            updateStats();
-        }
-
-        async function changeDownloadPath() {
-            try {
-                const response = await fetch('/api/select-folder', {
-                    method: 'POST'
-                });
-                const data = await response.json();
-                
-                if (data.path) {
-                    settings.downloadPath = data.path;
-                    document.getElementById('downloadPath').textContent = data.path;
-                    saveSettings();
-                    showMessage('✅ 下载路径已更新', 'success');
-                }
-            } catch (error) {
-                showMessage('❌ 无法更改路径', 'error');
-            }
-        }
-
-        async function startDownload() {
-            const selected = document.querySelectorAll('.video-checkbox:checked');
-            
-            if (selected.length === 0) {
-                showMessage('请至少选择一个视频', 'error');
-                return;
-            }
-
-            saveSettings();
-
-            const downloadBtn = document.getElementById('downloadBtn');
-            downloadBtn.disabled = true;
-            downloadBtn.textContent = '⏳ 准备下载...';
-
-            const downloads = [];
-            
-            for (const checkbox of selected) {
-                const videoId = checkbox.dataset.videoId;
-                const videoInfo = currentData.playlist.find(v => v.id === videoId);
-                
-                if (videoInfo) {
-                    downloads.push({
-                        id: videoId,
-                        url: videoInfo.url,
-                        title: videoInfo.original_title || videoInfo.title,
-                        video_info: videoInfo
-                    });
-                }
-            }
-
-            try {
-                const response = await fetch('/api/download', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ 
-                        downloads,
-                        settings: settings
-                    })
-                });
-
-                const data = await response.json();
-                downloadTaskId = data.task_id;
-                
-                document.getElementById('downloadProgress').style.display = 'block';
-                monitorProgress();
-                
-            } catch (error) {
-                showMessage('❌ 启动下载失败: ' + error.message, 'error');
-            } finally {
-                downloadBtn.disabled = false;
-                downloadBtn.textContent = '🚀 开始下载';
-            }
-        }
-
-        async function monitorProgress() {
-            if (!downloadTaskId) return;
-
-            try {
-                const response = await fetch(`/api/progress/${downloadTaskId}`);
-                const data = await response.json();
-                
-                const total = data.total;
-                const completed = data.completed;
-                const failed = data.failed;
-                const progress = Math.round((completed + failed) / total * 100);
-                
-                const progressFill = document.getElementById('progressFill');
-                const progressText = document.getElementById('progressText');
-                progressFill.style.width = progress + '%';
-                progressText.textContent = progress + '%';
-                
-                document.getElementById('progressCount').textContent = `${completed + failed} / ${total}`;
-                document.getElementById('progressStatus').textContent = data.status === 'completed' ? '✅ 完成' : '⏳ 下载中';
-                document.getElementById('remainingTime').textContent = `剩余: ${data.remaining || '--:--'}`;
-                
-                if (data.current_file) {
-                    document.getElementById('currentFileName').textContent = data.current_file.name || '-';
-                    
-                    const currentProgress = data.current_file.progress || 0;
-                    document.getElementById('currentProgressFill').style.width = currentProgress + '%';
-                    document.getElementById('currentProgressText').textContent = currentProgress + '%';
-                    
-                    document.getElementById('downloadSpeed').textContent = `速度: ${data.current_file.speed || '0'} MB/s`;
-                    document.getElementById('downloadSize').textContent = `${data.current_file.downloaded || '0'} MB / ${data.current_file.total || '0'} MB`;
-                    document.getElementById('retryInfo').textContent = `重试: ${data.current_file.retry || '0'}/${settings.retryCount}`;
-                }
-                
-                if (data.queue) {
-                    updateDownloadQueue(data.queue);
-                }
-                
-                if (data.results && data.results.length > 0) {
-                    displayResults(data.results);
-                }
-                
-                if (data.status !== 'completed') {
-                    setTimeout(() => monitorProgress(), 500);
-                } else {
-                    const msg = failed > 0 
-                        ? `⚠️ 下载完成！成功: ${completed}, 失败: ${failed}`
-                        : `✅ 全部下载成功！共 ${completed} 个文件`;
-                    showMessage(msg, failed > 0 ? 'error' : 'success');
-                    
-                    document.getElementById('currentFileName').textContent = '-';
-                    document.getElementById('currentProgressFill').style.width = '0%';
-                    document.getElementById('currentProgressText').textContent = '0%';
-                }
-                
-            } catch (error) {
-                console.error('获取进度失败:', error);
-                setTimeout(() => monitorProgress(), 2000);
-            }
-        }
-        
-        function updateDownloadQueue(queue) {
-            const queueDiv = document.getElementById('downloadQueue');
-            let html = '';
-            
-            queue.forEach(item => {
-                const statusIcon = {
-                    'waiting': '⏳',
-                    'downloading': '📥',
-                    'completed': '✅',
-                    'failed': '❌'
-                }[item.status] || '⏳';
-                
-                html += `
-                    <div class="queue-item ${item.status}">
-                        <span style="color: var(--text-primary); font-size: 14px; flex: 1;">
-                            ${statusIcon} ${item.title}
-                        </span>
-                        <span class="queue-status">
-                            ${item.status === 'downloading' ? '下载中...' : 
-                              item.status === 'completed' ? '完成' :
-                              item.status === 'failed' ? '失败' : '等待'}
-                        </span>
-                    </div>
-                `;
-            });
-            
-            queueDiv.innerHTML = html;
-        }
-
-        function displayResults(results) {
-            const resultsDiv = document.getElementById('downloadResults');
-            let html = '<h3 style="color: var(--text-primary); margin-bottom: 16px;">📋 下载详情</h3>';
-            
-            results.forEach(result => {
-                const className = result.status === 'success' ? 'result-success' : 'result-failed';
-                const icon = result.status === 'success' ? '✅' : '❌';
-                const status = result.status === 'success' ? '成功' : '失败';
-                
-                html += `
-                    <div class="result-item ${className}">
-                        <span>${icon} ${result.title}</span>
-                        <span>${status}</span>
-                    </div>
-                `;
-            });
-            
-            resultsDiv.innerHTML = html;
-        }
-
-        function showMessage(message, type = 'info') {
-            const statusMessage = document.getElementById('statusMessage');
-            statusMessage.className = `status-message status-${type}`;
-            statusMessage.textContent = message;
-            statusMessage.style.display = 'block';
-            
-            if (type === 'success' || type === 'error') {
-                setTimeout(() => {
-                    statusMessage.style.display = 'none';
-                }, 5000);
-            }
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            loadSettings();
-            
-            document.getElementById('urlInput').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                    analyzeUrl();
-                }
-            });
-            
-            document.getElementById('downloadDelay').addEventListener('change', saveSettings);
-            document.getElementById('qualityPriority').addEventListener('change', saveSettings);
-            document.getElementById('retryCount').addEventListener('change', saveSettings);
-        });
-    </script>
-</body>
-</html>
-'''
-
-def sanitize_filename(filename):
-    """保留原始文件名，只移除真正的非法字符"""
+# ====================== 常量 & 设置 =======================
+WATCH_RE = re.compile(r'^https?://(?:www\.)?hanime1\.me/watch\?v=\d+$')
+DEFAULT_DIR = Path.home() / 'Downloads' / 'Videos'
+
+@dataclass
+class Settings:
+    retry: int = 3
+    threads: int = 3
+    delay: int = 2
+    stagger: float = 0.8
+    priority: str = 'highest'   # highest/balanced/fastest
+    directory: Path = DEFAULT_DIR
+
+    # 标题策略：强制 share_h3（本版固定为 share_h3；仅保留 as_shown 作为展示用途）
+    title_mode: str = 'share_h3'  # share_h3 / as_shown
+
+    headless: bool = True
+    parse_with_images: bool = True
+
+CFG = Settings()
+
+# ====================== 数据结构 =======================
+@dataclass
+class VideoItem:
+    id: str
+    url: str
+    title: str
+    original_title: str
+    is_current: bool
+    is_same_series: bool
+    best_quality: Optional[str] = None
+    best_link: Optional[str] = None
+    estimated_size: Optional[float] = None  # MB
+
+@dataclass
+class AnalyzeResult:
+    url: str
+    title: str
+    series_name: str
+    playlist: List[VideoItem]
+    timestamp: str
+
+# ====================== 工具函数 =======================
+
+def sanitize_filename(filename: str) -> str:
     if not filename:
-        return "untitled"
-    illegal_chars = '<>:"/\\|?*'
-    for char in illegal_chars:
-        filename = filename.replace(char, '_')
-    filename = ''.join(char for char in filename if ord(char) >= 32)
+        return 'untitled'
+    for ch in '<>:"/\\|?*':
+        filename = filename.replace(ch, '_')
+    filename = ''.join(c for c in filename if ord(c) >= 32)
     return filename.strip()
 
-def get_chrome_driver():
-    """创建静音的Chrome驱动"""
+
+def format_time(seconds: float) -> str:
+    if seconds < 0 or seconds > 24*3600:
+        return '--:--'
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+# ====================== 交互输入（带超时） =======================
+PROMPT_LOCK = threading.Lock()
+
+
+def _timed_input(prompt: str, timeout: float, default: str) -> str:
+    buf = {"val": None}
+    def _reader():
+        try:
+            buf["val"] = input(prompt)
+        except EOFError:
+            pass
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start(); t.join(timeout)
+    val = buf["val"]
+    return default if val is None or str(val).strip() == '' else str(val).strip()
+
+
+def ask_overwrite_skip(path: Path, timeout: int = 10) -> bool:
+    with PROMPT_LOCK:
+        fname = path.name
+        if RICH:
+            console.print(Panel.fit(
+                f"[warn]文件已存在[/warn]：[hl]{fname}[/hl]\n选择 [S]跳过 / [O]覆盖（删除后重下）\n[dim]{timeout}s 内不操作将默认 [S] 跳过[/dim]",
+                title="冲突处理", border_style="warn"
+            ))
+            ans = _timed_input(
+                "> 请输入 S 或 O: ", timeout=timeout, default="S"
+            )
+        else:
+            print(f"文件已存在：{fname}\n选择 S=跳过 / O=覆盖（删除后重下）\n{timeout}s 内不操作将默认跳过")
+            ans = _timed_input("请输入 S 或 O: ", timeout=timeout, default="S")
+    return ans.lower().startswith('o')
+
+# ====================== Selenium 驱动 =======================
+
+def get_chrome_driver(headless: bool = True, images_enabled: bool = True) -> webdriver.Chrome:
     chrome_options = Options()
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    if headless:
+        chrome_options.add_argument('--headless=new')
+    for a in [
+        '--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
+        '--mute-audio', '--autoplay-policy=no-user-gesture-required', '--disable-gpu',
+        '--window-size=1920,1080', '--ignore-certificate-errors', '--allow-running-insecure-content',
+    ]:
+        chrome_options.add_argument(a)
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument('--mute-audio')
-    chrome_options.add_argument('--autoplay-policy=no-user-gesture-required')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--disable-images')
     chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-    chrome_options.add_argument('--disable-logging')
-    chrome_options.add_argument('--log-level=3')
-    chrome_options.add_argument('--window-size=1920,1080')
-    
     prefs = {
-        "profile.default_content_setting_values.media_stream_mic": 2,
-        "profile.default_content_setting_values.media_stream_camera": 2,
-        "profile.default_content_setting_values.geolocation": 2,
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.default_content_settings.popups": 0,
+        'profile.default_content_setting_values.media_stream_mic': 2,
+        'profile.default_content_setting_values.media_stream_camera': 2,
+        'profile.default_content_setting_values.geolocation': 2,
+        'profile.default_content_setting_values.notifications': 2,
+        'profile.managed_default_content_settings.images': 1 if images_enabled else 2,
     }
-    chrome_options.add_experimental_option("prefs", prefs)
-    
+    chrome_options.add_experimental_option('prefs', prefs)
+    chrome_options.set_capability('acceptInsecureCerts', True)
     return webdriver.Chrome(options=chrome_options)
 
-def select_best_quality(video_links, priority='highest'):
-    """根据优先级选择最佳画质"""
+# ====================== 标题统一：强制从 #shareBtn-title =======================
+
+# 直接 HTTP 抓页面源码：优先 #shareBtn-title，其次 og:title，再次 <title>
+_RE_H3 = re.compile(r'id=["\']shareBtn-title["\'][^>]*>([^<]+)<', re.I)
+_RE_OG = re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+_RE_TIT = re.compile(r'<title>([^<]+)</title>', re.I)
+_HTTP_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Referer': 'https://hanime1.me/',
+    # 偏向日文，避免中文自动翻译
+    'Accept-Language': 'ja,ja-JP;q=0.9,en-US;q=0.7,en;q=0.5',
+}
+
+def title_from_share_h3_http(url: str, timeout: int = 15) -> Optional[str]:
+    try:
+        with requests.Session() as s:
+            r = s.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            html = r.text
+        m = _RE_H3.search(html)
+        if m:
+            return m.group(1).strip()
+        m = _RE_OG.search(html)
+        if m:
+            return m.group(1).strip()
+        m = _RE_TIT.search(html)
+        if m:
+            return m.group(1).split(' - ')[0].strip()
+    except Exception:
+        return None
+    return None
+
+# 兜底：用 Selenium 读 #shareBtn-title
+
+def title_from_share_h3_selenium(url: str, headless: bool = True) -> Optional[str]:
+    d = get_chrome_driver(headless=headless, images_enabled=False)
+    try:
+        d.get(url)
+        WebDriverWait(d, 15).until(lambda x: x.title != '')
+        with contextlib.suppress(Exception):
+            return d.find_element(By.ID, 'shareBtn-title').text.strip() or None
+        with contextlib.suppress(Exception):
+            return d.title.split(' - ')[0].strip() or None
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            d.quit()
+
+# 统一入口：强制拿到 share_h3；HTTP > Selenium > None
+
+def force_share_title(url: str) -> Optional[str]:
+    t = title_from_share_h3_http(url)
+    if t:
+        return t
+    return title_from_share_h3_selenium(url, headless=CFG.headless)
+
+# ====================== 解析 watch 页面 =======================
+
+def extract_series_name(title: str) -> str:
+    if not title:
+        return ''
+    t = re.sub(r'\[.*?\]', '', title)
+    t = re.sub(r'\s*\d+\s*$', '', t)
+    t = re.sub(r'\s*[一二三四五六七八九十]+\s*$', '', t)
+    return t.strip()
+
+
+def select_best_quality(video_links: List[str], priority: str = 'highest') -> Tuple[Optional[str], Optional[str]]:
     if not video_links:
         return None, None
-    
-    if priority == 'highest':
-        quality_priority = ['1080p', '720p', '480p', '360p', '240p']
-    elif priority == 'balanced':
-        quality_priority = ['720p', '1080p', '480p', '360p', '240p']
-    else:
-        quality_priority = ['480p', '360p', '720p', '240p', '1080p']
-    
-    for quality in quality_priority:
+    order = {
+        'highest': ['1080p','720p','480p','360p','240p'],
+        'balanced': ['720p','1080p','480p','360p','240p'],
+        'fastest': ['480p','360p','720p','240p','1080p'],
+    }.get(priority, ['1080p','720p','480p','360p','240p'])
+    for q in order:
         for link in video_links:
-            if quality.lower() in link.lower():
-                return link, quality
-    
+            if q.lower() in link.lower() or re.search(rf'[=/_-]{q[:-1]}p(?!\d)', link, re.I):
+                return link, q
     return video_links[0], 'unknown'
 
-@app.route('/')
-def index():
-    """主页"""
-    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/select-folder', methods=['POST'])
-def select_folder():
-    """选择下载文件夹"""
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        folder_path = filedialog.askdirectory(
-            title="选择下载目录",
-            initialdir=download_settings['download_dir']
+def _locate_playlist_container(driver: webdriver.Chrome):
+    for sel in [(By.ID, 'playlist-scroll'), (By.CSS_SELECTOR, 'div.hover-video-playlist')]:
+        with contextlib.suppress(Exception):
+            return driver.find_element(*sel)
+    return None
+
+
+def preload_playlist(driver, container, step=800, max_rounds=40, sleep=0.25):
+    sel = "div > a[href*='watch?v=']"
+    last_count = -1; rounds_no_growth = 0
+    for _ in range(max_rounds):
+        links = container.find_elements(By.CSS_SELECTOR, sel)
+        count = len(links)
+        if count == last_count: rounds_no_growth += 1
+        else: rounds_no_growth = 0
+        last_count = count
+        end_reached = driver.execute_script(
+            "return Math.abs(arguments[0].scrollTop + arguments[0].clientHeight - arguments[0].scrollHeight) < 5;",
+            container
         )
-        root.destroy()
-        
-        if folder_path:
-            download_settings['download_dir'] = folder_path
-            return jsonify({'path': folder_path})
-        else:
-            return jsonify({'path': download_settings['download_dir']})
-    except:
-        return jsonify({'path': download_settings['download_dir']})
+        if end_reached and rounds_no_growth >= 2:
+            break
+        driver.execute_script("arguments[0].scrollBy(0, arguments[1]);", container, step)
+        time.sleep(sleep)
 
-@app.route('/api/analyze', methods=['POST'])
-def analyze_url():
-    """分析URL"""
-    try:
-        data = request.json
-        url = data.get('url', '')
-        settings = data.get('settings', {})
-        
-        if not re.match(r'https://hanime1\.me/watch\?v=\d+', url):
-            return jsonify({'error': 'Invalid URL format'}), 400
-        
-        driver = get_chrome_driver()
-        result = {
-            'url': url,
-            'title': '',
-            'series_name': '',
-            'playlist': [],
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        try:
-            print(f"[分析] 访问: {url}")
-            driver.get(url)
-            wait = WebDriverWait(driver, 20)
-            time.sleep(2)
-            
-            current_original_title = ""
-            try:
-                title_element = driver.find_element(By.ID, "shareBtn-title")
-                current_original_title = title_element.text.strip()
-                result['title'] = current_original_title
-            except:
-                try:
-                    result['title'] = driver.title.split(' - ')[0].strip()
-                except:
-                    pass
-            
-            series_name = ""
-            if current_original_title:
-                pattern = current_original_title
-                pattern = re.sub(r'\[.*?\]', '', pattern)
-                pattern = re.sub(r'\s*\d+\s*$', '', pattern)
-                pattern = re.sub(r'\s*[一二三四五六七八九十]+\s*$', '', pattern)
-                series_name = pattern.strip()
-                result['series_name'] = series_name
-            
-            print(f"[分析] 当前标题: {current_original_title}")
-            print(f"[分析] 系列名称: {series_name}")
-            
-            playlist_container = None
-            try:
-                playlist_container = driver.find_element(By.ID, "playlist-scroll")
-            except:
-                try:
-                    playlist_container = driver.find_element(By.CSS_SELECTOR, "div.hover-video-playlist")
-                except:
-                    pass
-            
-            if playlist_container:
-                link_elements = playlist_container.find_elements(By.CSS_SELECTOR, "div > a[href*='watch?v=']")
-                print(f"[分析] 找到 {len(link_elements)} 个视频")
-                
-                for idx, link_element in enumerate(link_elements):
-                    try:
-                        href = link_element.get_attribute("href")
-                        if not href or not re.match(r'https://hanime1\.me/watch\?v=\d+', href):
-                            continue
-                        
-                        parent_div = link_element.find_element(By.XPATH, "..")
-                        
-                        video_title = ""
-                        try:
-                            title_elem = parent_div.find_element(By.CSS_SELECTOR, ".card-mobile-title")
-                            video_title = title_elem.text.strip()
-                        except:
-                            inner_divs = parent_div.find_elements(By.CSS_SELECTOR, "div")
-                            for div in inner_divs:
-                                text = div.text.strip()
-                                if text and len(text) > 2 and not re.match(r'^\d+:\d+$', text) and '次' not in text:
-                                    video_title = text
-                                    break
-                        
-                        if not video_title:
-                            video_title = f"视频 {idx + 1}"
-                        
-                        is_current = href == url or '現正播放' in parent_div.text
-                        
-                        is_same_series = False
-                        if series_name:
-                            clean_title = re.sub(r'\[.*?\]', '', video_title).strip()
-                            if series_name in clean_title or \
-                               re.sub(r'\s*\d+\s*$', '', clean_title).strip() == series_name:
-                                is_same_series = True
-                        
-                        playlist_item = {
-                            'id': hashlib.md5(href.encode()).hexdigest()[:8],
-                            'url': href,
-                            'title': video_title,
-                            'original_title': video_title,
-                            'is_current': is_current,
-                            'is_same_series': is_same_series,
-                            'best_quality': None,
-                            'estimated_size': round(300 + (idx * 50), 2)
-                        }
-                        
-                        if is_current and current_original_title:
-                            playlist_item['original_title'] = current_original_title
-                        
-                        result['playlist'].append(playlist_item)
-                        
-                    except Exception as e:
-                        print(f"[错误] 处理视频 {idx}: {e}")
-                        continue
-            
-            try:
-                play_button = driver.find_element(By.CSS_SELECTOR, "div.plyr > button")
-                play_button.click()
-                time.sleep(3)
-            except:
-                pass
-            
-            video_urls = []
-            
-            try:
-                video_elements = driver.find_elements(By.TAG_NAME, "video")
-                for video in video_elements:
-                    src = video.get_attribute("src")
-                    if src:
-                        video_urls.append(src)
-            except:
-                pass
-            
-            try:
-                page_source = driver.page_source
-                m3u8_links = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', page_source)
-                video_urls.extend(m3u8_links)
-                
-                mp4_links = re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', page_source)
-                video_urls.extend(mp4_links)
-            except:
-                pass
-            
-            video_urls = list(set(video_urls))
-            
-            quality_priority = settings.get('qualityPriority', 'highest')
-            best_link, best_quality = select_best_quality(video_urls, quality_priority)
-            
-            for item in result['playlist']:
-                if item['is_current']:
-                    item['video_links'] = video_urls
-                    item['best_quality'] = best_quality
-                    item['best_link'] = best_link
-                    if best_quality == '1080p':
-                        item['estimated_size'] = 800
-                    elif best_quality == '720p':
-                        item['estimated_size'] = 500
-                    else:
-                        item['estimated_size'] = 300
-                    break
-            
-            result['playlist'].sort(key=lambda x: (not x['is_same_series'], not x['is_current']))
-            
-        finally:
-            driver.quit()
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        print(f"[错误] 分析失败: {e}")
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/download', methods=['POST'])
-def start_download():
-    """启动单线程顺序下载"""
+def smart_title_from_card(driver, card_or_link):
+    js = r"""
+    const el = arguments[0];
+    function txt(n){ return (n && (n.innerText || n.textContent) || '').trim(); }
+    let t = '';
+    let cand = el.querySelector('.card-mobile-title, .card-title, [class*="title"], [class*="name"]');
+    if (cand) t = txt(cand);
+    if (!t) {
+      const img = el.querySelector('img[alt]');
+      if (img && img.alt) t = img.alt.trim();
+    }
+    if (!t) {
+      t = (el.getAttribute('title') || el.getAttribute('aria-label') || (el.dataset && (el.dataset.title || el.dataset.name)) || '').trim();
+    }
+    if (!t) t = txt(el);
+    if (!t && el.parentElement) {
+      const p = el.parentElement;
+      cand = p.querySelector('.card-mobile-title, .card-title, [class*="title"], [class*="name"]');
+      if (cand) t = txt(cand);
+      if (!t) {
+        t = (p.getAttribute('title') || p.getAttribute('aria-label') || (p.dataset && (p.dataset.title || p.dataset.name)) || '').trim();
+      }
+      if (!t) t = txt(p);
+    }
+    return t;
+    """
     try:
-        data = request.json
-        downloads = data.get('downloads', [])
-        settings = data.get('settings', {})
-        
-        if not downloads:
-            return jsonify({'error': 'No videos to download'}), 400
-        
-        download_settings['download_delay'] = settings.get('downloadDelay', 3)
-        download_settings['retry_count'] = settings.get('retryCount', 3)
-        download_settings['download_dir'] = settings.get('downloadPath', download_settings['download_dir'])
-        
-        task_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
-        download_progress[task_id] = {
-            'total': len(downloads),
-            'completed': 0,
-            'failed': 0,
-            'current': '',
-            'status': 'processing',
-            'results': [],
-            'queue': [],
-            'current_file': None,
-            'remaining': '--:--'
-        }
-        
-        for item in downloads:
-            download_progress[task_id]['queue'].append({
-                'title': item.get('title', ''),
-                'status': 'waiting'
-            })
-        
-        thread = threading.Thread(
-            target=process_downloads_sequential,
-            args=(task_id, downloads, settings)
-        )
-        thread.start()
-        download_tasks[task_id] = thread
-        
-        return jsonify({'task_id': task_id})
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return (driver.execute_script(js, card_or_link) or "").strip()
+    except Exception:
+        return ""
 
-def fetch_video_details(url):
-    """获取视频详细信息"""
-    driver = get_chrome_driver()
+
+def analyze_watch(url: str, priority: str = 'highest', headless: bool = True, images_enabled: bool = True, timeout: int = 20) -> AnalyzeResult:
+    if not WATCH_RE.match(url):
+        raise ValueError('URL 不合法，应为 https://hanime1.me/watch?v=xxxxx')
+
+    driver = get_chrome_driver(headless=headless, images_enabled=images_enabled)
+    title = ''
+    series_name = ''
+    playlist: List[VideoItem] = []
+
     try:
+        c_info(f'访问: {url}')
         driver.get(url)
-        time.sleep(2)
-        
-        original_title = ""
-        try:
-            title_element = driver.find_element(By.ID, "shareBtn-title")
-            original_title = title_element.text.strip()
-        except:
-            try:
-                original_title = driver.title.split(' - ')[0].strip()
-            except:
-                pass
-        
-        try:
-            play_button = driver.find_element(By.CSS_SELECTOR, "div.plyr > button")
-            play_button.click()
-            time.sleep(3)
-        except:
-            pass
-        
+        WebDriverWait(driver, timeout).until(lambda d: d.title != '')
+        time.sleep(1.2)
+
+        # 当前页标题：从 shareBtn-title 抓取，确保与 HTTP 规则一致
+        with contextlib.suppress(Exception):
+            title = driver.find_element(By.ID, 'shareBtn-title').text.strip()
+        if not title:
+            with contextlib.suppress(Exception):
+                title = driver.title.split(' - ')[0].strip()
+        series_name = extract_series_name(title)
+        if series_name:
+            c_info(f'系列名：{series_name}')
+
+        # 尝试触发播放，提高页面注入直链概率
+        with contextlib.suppress(Exception):
+            driver.find_element(By.CSS_SELECTOR, 'div.plyr > button').click(); time.sleep(1.2)
+
+        # 当前页直链
         video_urls = []
-        
-        try:
-            video_elements = driver.find_elements(By.TAG_NAME, "video")
-            for video in video_elements:
-                src = video.get_attribute("src")
-                if src:
-                    video_urls.append(src)
-        except:
-            pass
-        
-        try:
-            page_source = driver.page_source
-            m3u8_links = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', page_source)
-            video_urls.extend(m3u8_links)
-            
-            mp4_links = re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', page_source)
-            video_urls.extend(mp4_links)
-        except:
-            pass
-        
-        video_urls = list(set(video_urls))
-        best_link, best_quality = select_best_quality(video_urls)
-        
-        return {
-            'original_title': original_title,
-            'best_link': best_link,
-            'best_quality': best_quality,
-            'all_links': video_urls
-        }
-        
+        with contextlib.suppress(Exception):
+            for v in driver.find_elements(By.TAG_NAME, 'video'):
+                src = v.get_attribute('src')
+                if src: video_urls.append(src)
+        with contextlib.suppress(Exception):
+            html = driver.page_source
+            video_urls += re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
+            video_urls += re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html)
+        video_urls = list(dict.fromkeys(video_urls))
+        best_link, best_quality = select_best_quality(video_urls, priority)
+
+        # 播放列表容器
+        playlist_container = _locate_playlist_container(driver)
+        link_elems = []
+        if playlist_container:
+            preload_playlist(driver, playlist_container)
+            with contextlib.suppress(Exception):
+                link_elems = playlist_container.find_elements(By.CSS_SELECTOR, "div > a[href*='watch?v=']")
+        c_info(f'播放列表条目: {len(link_elems)}')
+
+        if link_elems:
+            for idx, link in enumerate(link_elems):
+                try:
+                    href = link.get_attribute('href')
+                    if not href or not WATCH_RE.match(href):
+                        continue
+                    try:
+                        card = link.find_element(By.XPATH, '..')
+                    except Exception:
+                        card = link
+                    shown = smart_title_from_card(driver, card) or smart_title_from_card(driver, link) or f"视频 {idx+1}"
+                    is_current = (href == url) or ('現正播放' in (card.text or ''))
+                    clean = re.sub(r'\[.*?\]', '', shown).strip()
+                    same = False
+                    if series_name and (series_name in clean or re.sub(r'\s*\d+\s*$', '', clean).strip() == series_name):
+                        same = True
+                    item = VideoItem(
+                        id=hashlib.md5(href.encode()).hexdigest()[:8],
+                        url=href,
+                        title=shown,
+                        original_title=shown,  # 稍后统一用 share_h3 覆盖
+                        is_current=is_current,
+                        is_same_series=same,
+                        estimated_size=round(300 + (idx * 50), 2)
+                    )
+                    if is_current:
+                        item.original_title = title or shown
+                        item.best_link = best_link
+                        item.best_quality = best_quality
+                        item.estimated_size = 800 if best_quality == '1080p' else (500 if best_quality == '720p' else 300)
+                    playlist.append(item)
+                except Exception as e:
+                    c_warn(f'条目失败: {e}')
+        else:
+            # 没列表也保证有一条
+            item = VideoItem(
+                id=hashlib.md5(url.encode()).hexdigest()[:8],
+                url=url,
+                title=title or '当前视频',
+                original_title=title or '当前视频',
+                is_current=True,
+                is_same_series=bool(series_name),
+                best_quality=best_quality,
+                best_link=best_link,
+                estimated_size=800 if best_quality == '1080p' else (500 if best_quality == '720p' else 300)
+            )
+            playlist.append(item)
+
+        # ★ 统一：对“所有”条目强制用 share_h3 原名覆盖（并发提高速度）
+        def _fix(it: VideoItem) -> None:
+            nm = force_share_title(it.url)
+            if nm:
+                it.original_title = nm
+        with cf.ThreadPoolExecutor(max_workers=min(8, len(playlist) or 1)) as ex:
+            list(ex.map(_fix, playlist))
+
+        # 排序：同系列优先、当前置顶
+        playlist.sort(key=lambda x: (not x.is_same_series, not x.is_current))
+        return AnalyzeResult(url=url, title=title, series_name=series_name, playlist=playlist, timestamp=datetime.now().isoformat())
     finally:
-        driver.quit()
+        with contextlib.suppress(Exception):
+            driver.quit()
 
-def download_with_retry(url, output_path, max_retries=3):
-    """带重试机制的下载"""
-    for attempt in range(max_retries):
-        try:
-            print(f"[下载] 尝试 {attempt + 1}/{max_retries}: {output_path.name}")
-            
-            if '.m3u8' in url:
-                success = download_with_ffmpeg(url, str(output_path))
-            else:
-                success = download_with_requests(url, str(output_path))
-            
-            if success and output_path.exists():
-                print(f"[成功] 下载完成: {output_path.name}")
-                return True
-            
-            if attempt < max_retries - 1:
-                print(f"[重试] 等待5秒后重试...")
-                time.sleep(5)
-                
-        except Exception as e:
-            print(f"[错误] 下载失败 (尝试 {attempt + 1}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-    
-    print(f"[失败] 下载失败，已重试 {max_retries} 次")
-    return False
+# ====================== 直链获取（下载前兜底） =======================
 
-def process_downloads_sequential(task_id, download_list, settings):
-    """单线程顺序处理下载"""
-    download_dir = Path(settings.get('downloadPath', download_settings['download_dir']))
-    download_dir.mkdir(parents=True, exist_ok=True)
-    
-    delay = settings.get('downloadDelay', 3)
-    retry_count = settings.get('retryCount', 3)
-    
-    print(f"[下载] 开始顺序下载，间隔 {delay} 秒")
-    print(f"[下载] 保存到: {download_dir}")
-    
-    start_time = time.time()
-    
-    for index, item in enumerate(download_list):
-        try:
-            download_progress[task_id]['queue'][index]['status'] = 'downloading'
-            
-            video_info = item.get('video_info', {})
-            original_title = video_info.get('original_title', item.get('title', ''))
-            
-            download_progress[task_id]['current'] = original_title
-            download_progress[task_id]['current_file'] = {
-                'name': original_title,
-                'progress': 0,
-                'speed': '0',
-                'downloaded': '0',
-                'total': '0',
-                'retry': 0
-            }
-            
-            print(f"\n[{index + 1}/{len(download_list)}] 处理: {original_title}")
-            
-            best_link = video_info.get('best_link')
-            if not best_link:
-                print(f"[获取] 正在获取视频详情...")
-                details = fetch_video_details(item['url'])
-                original_title = details['original_title'] or original_title
-                best_link = details['best_link']
-            
-            if not best_link:
-                raise Exception("无法获取视频链接")
-            
-            filename = sanitize_filename(original_title)
-            ext = '.mp4'
-            output_path = download_dir / f"{filename}{ext}"
-            
-            print(f"[保存] {output_path}")
-            
-            success = False
-            for retry in range(retry_count):
-                download_progress[task_id]['current_file']['retry'] = retry
-                
-                if retry > 0:
-                    print(f"[重试] 第 {retry}/{retry_count} 次重试")
-                    time.sleep(3)
-                
-                success = download_with_retry(best_link, output_path, 1)
-                if success:
-                    break
-            
-            if success:
-                download_progress[task_id]['completed'] += 1
-                download_progress[task_id]['queue'][index]['status'] = 'completed'
-                download_progress[task_id]['results'].append({
-                    'title': original_title,
-                    'status': 'success',
-                    'filename': output_path.name
-                })
-                print(f"[✓] 成功: {original_title}")
-            else:
-                download_progress[task_id]['failed'] += 1
-                download_progress[task_id]['queue'][index]['status'] = 'failed'
-                download_progress[task_id]['results'].append({
-                    'title': original_title,
-                    'status': 'failed',
-                    'error': f'Failed after {retry_count} retries'
-                })
-                print(f"[✗] 失败: {original_title}")
-            
-            elapsed = time.time() - start_time
-            completed = download_progress[task_id]['completed'] + download_progress[task_id]['failed']
-            if completed > 0:
-                avg_time = elapsed / completed
-                remaining = (len(download_list) - completed) * avg_time
-                download_progress[task_id]['remaining'] = format_time(remaining)
-            
-            if index < len(download_list) - 1:
-                print(f"[等待] 防风控延迟 {delay} 秒...")
-                time.sleep(delay)
-                
-        except Exception as e:
-            print(f"[错误] 处理失败: {e}")
-            download_progress[task_id]['failed'] += 1
-            download_progress[task_id]['queue'][index]['status'] = 'failed'
-            download_progress[task_id]['results'].append({
-                'title': item.get('title', 'Unknown'),
-                'status': 'failed',
-                'error': str(e)
-            })
-    
-    download_progress[task_id]['status'] = 'completed'
-    download_progress[task_id]['current'] = ''
-    download_progress[task_id]['current_file'] = None
-    print(f"\n[完成] 全部下载完成！成功: {download_progress[task_id]['completed']}, 失败: {download_progress[task_id]['failed']}")
-
-def format_time(seconds):
-    """格式化时间"""
-    if seconds < 0 or seconds > 86400:
-        return "--:--"
-    
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    else:
-        return f"{minutes:02d}:{secs:02d}"
-
-def download_with_ffmpeg(url, output_path):
-    """使用ffmpeg下载（静音）"""
+def fetch_video_details(url: str, priority: str = 'highest', headless: bool = True, images_enabled: bool = False) -> Dict[str, Optional[str]]:
+    d = get_chrome_driver(headless=headless, images_enabled=images_enabled)
     try:
-        cmd = [
-            'ffmpeg',
-            '-i', url,
-            '-c', 'copy',
-            '-bsf:a', 'aac_adtstoasc',
-            '-loglevel', 'quiet',
-            '-stats',
-            '-y',
-            str(output_path)
-        ]
-        
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return process.returncode == 0 and Path(output_path).exists()
-        
-    except subprocess.TimeoutExpired:
-        print(f"[错误] ffmpeg超时")
-        return False
+        d.get(url)
+        time.sleep(1.0)
+        with contextlib.suppress(Exception):
+            d.find_element(By.CSS_SELECTOR, 'div.plyr > button').click(); time.sleep(1.0)
+        title = ''
+        with contextlib.suppress(Exception):
+            title = d.find_element(By.ID, 'shareBtn-title').text.strip()
+        if not title:
+            with contextlib.suppress(Exception):
+                title = d.title.split(' - ')[0].strip()
+        links = []
+        with contextlib.suppress(Exception):
+            for v in d.find_elements(By.TAG_NAME, 'video'):
+                src = v.get_attribute('src')
+                if src: links.append(src)
+        with contextlib.suppress(Exception):
+            html = d.page_source
+            links += re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
+            links += re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html)
+        links = list(dict.fromkeys(links))
+        best_link, best_quality = select_best_quality(links, priority)
+        return {'original_title': title, 'best_link': best_link, 'best_quality': best_quality, 'all_links': links}
+    finally:
+        with contextlib.suppress(Exception):
+            d.quit()
+
+# ====================== 下载实现（requests / ffmpeg） =======================
+
+def ensure_ffmpeg() -> bool:
+    return shutil.which('ffmpeg') is not None
+
+
+def download_with_ffmpeg(url: str, output_path: Path) -> bool:
+    cmd = ['ffmpeg', '-y', '-i', url, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-loglevel', 'error', '-stats', str(output_path)]
+    try:
+        subprocess.run(cmd, check=True)
+        return output_path.exists()
     except FileNotFoundError:
-        print("[错误] ffmpeg未安装，请先安装ffmpeg")
+        c_err('未检测到 ffmpeg，请先安装')
+        return False
+    except subprocess.CalledProcessError as e:
+        c_err(f'ffmpeg 返回非零：{e}')
         return False
     except Exception as e:
-        print(f"[错误] ffmpeg下载失败: {e}")
+        c_err(f'ffmpeg 异常：{e}')
         return False
 
-def download_with_requests(url, output_path):
-    """使用requests下载（带进度）"""
+
+def download_with_requests(url: str, output_path: Path, progress: Optional[Progress]=None, task_id: Optional[int]=None) -> bool:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://hanime1.me/',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+    }
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://hanime1.me/',
-            'Accept': '*/*',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
-        }
-        
-        session = requests.Session()
-        response = session.get(url, headers=headers, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-        
-        session.close()
-        return Path(output_path).exists()
-        
+        with requests.Session() as s:
+            with s.get(url, headers=headers, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                chunk = 1024 * 64
+                if progress is not None and task_id is not None and total:
+                    progress.update(task_id, total=total)
+                with open(output_path, 'wb') as f:
+                    for part in r.iter_content(chunk_size=chunk):
+                        if not part:
+                            continue
+                        f.write(part)
+                        downloaded += len(part)
+                        if progress is not None and task_id is not None and total:
+                            progress.update(task_id, completed=downloaded)
+        return output_path.exists()
     except requests.exceptions.Timeout:
-        print(f"[错误] 下载超时")
+        c_err('下载超时')
         return False
     except Exception as e:
-        print(f"[错误] requests下载失败: {e}")
+        c_err(f'requests 下载失败：{e}')
         return False
 
-@app.route('/api/progress/<task_id>', methods=['GET'])
-def get_progress(task_id):
-    """获取下载进度"""
-    if task_id in download_progress:
-        return jsonify(download_progress[task_id])
+# ====================== 线程 worker & 并行驱动 =======================
+
+def worker_download(item: VideoItem, outdir: Path, priority: str, retry: int, headless: bool, images_enabled: bool,
+                    ui: Optional["Progress"]=None, global_task: Optional[int]=None, files_ui: Optional["Progress"]=None):
+    title = item.original_title or item.title
+    name = sanitize_filename(title)
+    out = outdir / f'{name}.mp4'
+
+    # 同名文件处理（10 秒默认跳过）
+    if out.exists():
+        overwrite = ask_overwrite_skip(out, timeout=10)
+        if not overwrite:
+            c_info(f"跳过已存在：{out.name}")
+            if RICH and ui is not None and global_task is not None:
+                ui.advance(global_task)
+            return
+        else:
+            with contextlib.suppress(Exception):
+                out.unlink()
+            c_warn(f"已删除旧文件，准备重新下载：{out.name}")
+
+    link = item.best_link
+    q = item.best_quality or 'unknown'
+    if not link:
+        det = fetch_video_details(item.url, priority=priority, headless=headless, images_enabled=images_enabled)
+        link = det.get('best_link')
+        q = det.get('best_quality') or q
+    if not link:
+        raise RuntimeError('无法获取直链')
+
+    task_id = None
+    if RICH and files_ui is not None:
+        # 关键修复：用 total=1 作为占位，后续在 download_with_requests 里替换为真实 total
+        task_id = files_ui.add_task("FILE", total=1, start=False, name=name, q=q)
+        files_ui.start_task(task_id)
+
+    success = False
+    for i in range(retry):
+        if i: time.sleep(2)
+        if '.m3u8' in link:
+            success = download_with_ffmpeg(link, out)
+        else:
+            success = download_with_requests(link, out, progress=files_ui, task_id=task_id)
+        if success:
+            break
+
+    if not success:
+        raise RuntimeError(f'重试 {retry} 次仍失败')
+
+    if RICH and files_ui is not None and task_id is not None:
+        task = files_ui.get_task(task_id)
+        # 若没拿到 content-length，就把 completed=total（1）以结束
+        files_ui.update(task_id, completed=task.total)
+        files_ui.stop_task(task_id)
+    if RICH and ui is not None and global_task is not None:
+        ui.advance(global_task)
+
+
+def run_parallel_download(items: List[VideoItem]):
+    total = len(items)
+    if total == 0:
+        c_warn('没有可下载的条目')
+        return
+    CFG.directory.mkdir(parents=True, exist_ok=True)
+    c_info(f'开始下载：{total} 个文件 → {CFG.directory} | 线程={CFG.threads} | 重试={CFG.retry} | 延迟={CFG.delay}s | 错峰={CFG.stagger}s')
+
+    stop_event = threading.Event()
+    def _sigint_handler(signum, frame):
+        stop_event.set()
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, _sigint_handler)
+
+    if RICH:
+        global_cols = [
+            TextColumn("[good]全局[/good]", justify="left"),
+            BarColumn(bar_width=40),
+            TextColumn("{task.completed}/{task.total}", justify="right"),
+            TimeRemainingColumn(),
+        ]
+        file_cols = [
+            SpinnerColumn(),
+            TextColumn("[hl]{task.fields[name]}[/hl] • {task.fields[q]}", justify="left"),
+            BarColumn(bar_width=28),
+            # 只显示 completed/total（total 初始为 1，后续会被替换），不会再触发 None 格式化
+            TextColumn("{task.completed}/{task.total}", justify="right"),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+        ]
+        progress = Progress(*global_cols, transient=False, expand=True, console=console)
+        files_progress = Progress(*file_cols, transient=False, expand=True, console=console)
+        with progress, files_progress:
+            global_task = progress.add_task("ALL", total=total)
+            with cf.ThreadPoolExecutor(max_workers=CFG.threads) as ex:
+                futures = []
+                for it in items:
+                    if stop_event.is_set():
+                        break
+                    f = ex.submit(
+                        worker_download,
+                        it, CFG.directory, CFG.priority, CFG.retry,
+                        CFG.headless, False,  # 下载阶段图片可关闭
+                        progress, global_task, files_progress
+                    )
+                    futures.append(f)
+                    time.sleep(CFG.stagger)
+                for f in cf.as_completed(futures):
+                    with contextlib.suppress(Exception):
+                        f.result()
     else:
-        return jsonify({'error': 'Task not found'}), 404
+        done = 0; lock = threading.Lock()
+        def _wrap(it: VideoItem):
+            nonlocal done
+            try:
+                worker_download(it, CFG.directory, CFG.priority, CFG.retry, CFG.headless, False)
+                c_ok(f"完成：{it.original_title or it.title}")
+            except Exception as e:
+                c_err(f"失败：{it.original_title or it.title} | {e}")
+            finally:
+                with lock:
+                    done += 1
+                    print(f"进度 {done}/{total}")
+                time.sleep(CFG.delay)
+        with cf.ThreadPoolExecutor(max_workers=CFG.threads) as ex:
+            futs = []
+            for it in items:
+                futs.append(ex.submit(_wrap, it))
+                time.sleep(CFG.stagger)
+            for f in cf.as_completed(futs):
+                pass
+    c_ok('全部任务完成')
 
-@app.route('/api/settings', methods=['GET'])
-def get_settings():
-    """获取当前设置"""
-    return jsonify(download_settings)
+# ====================== 交互式菜单 =======================
 
-@app.route('/api/settings', methods=['POST'])
-def update_settings():
-    """更新设置"""
+def banner():
+    if RICH:
+        console.print(Panel.fit(
+            Text("视频下载器 CLI Pro\n单/多线程 · 防风控 · 智能重试", justify="center", style="hl"),
+            title="✨ HANIME1 助手", subtitle=f"默认下载目录: {CFG.directory}", border_style="hl"
+        ))
+    else:
+        print("="*70)
+        print(f"{BOLD}视频下载器 CLI Pro{RESET}  |  单/多线程 · 防风控 · 智能重试")
+        print("-"*70)
+        print(f"默认下载目录: {CFG.directory}")
+        print("="*70)
+
+
+def menu_table() -> None:
+    if RICH:
+        t = Table(title="请选择操作（输入编号，或一行速用：<编号> <URL/文件>）", title_style="info")
+        t.add_column("编号", justify="center", style="hl", no_wrap=True)
+        t.add_column("操作")
+        t.add_column("说明", style="dim")
+        t.add_row("1", "解析页面（仅查看）", "不下载，只列标题/系列/画质；可保存 plan.json 供后续批量")
+        t.add_row("2", "下载当前视频", "仅下载当前 watch 页对应视频")
+        t.add_row("3", "下载同系列", "自动识别与当前同系列条目并全部下载")
+        t.add_row("4", "下载播放列表全部", "先抓全量链接，再逐个按 \"原名\" 下载")
+        t.add_row("5", "使用计划文件下载", "从 plan.json 读取清单（可在 1 中生成/编辑）")
+        t.add_row("6", "设置选项", "目录/重试/延迟/错峰/线程数/画质/headless/解析图片/标题策略")
+        t.add_row("7", "退出", "再见")
+        console.print(t)
+        console.print("[dim]小技巧：\n  • 直接一行：`2 https://hanime1.me/watch?v=123456`\n  • 也可：`5 D:/plan.json`\n  • 风控重：把线程调低(1-2)并加大错峰/延迟。[/dim]")
+    else:
+        print("\n请选择操作：")
+        print("  1) 解析页面（仅查看）  —— 列标题/系列/画质，可保存 plan.json")
+        print("  2) 下载当前视频        —— 仅下载当前 watch 页")
+        print("  3) 下载同系列          —— 自动识别同系列并全部下载")
+        print("  4) 下载播放列表全部    —— 先抓全量链接，再逐个按原名下载")
+        print("  5) 使用计划文件下载    —— 从 plan.json 读取清单")
+        print("  6) 设置选项            —— 目录/重试/延迟/错峰/线程/画质/headless/解析图片/标题策略")
+        print("  7) 退出")
+
+
+def parse_choice_line(line: str) -> Tuple[Optional[int], Optional[str]]:
+    line = (line or '').strip()
+    if not line:
+        return None, None
+    parts = line.split(maxsplit=1)
     try:
-        data = request.json
-        download_settings.update(data)
-        return jsonify({'status': 'ok'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        opt = int(parts[0])
+    except ValueError:
+        return None, None
+    arg = parts[1].strip() if len(parts) > 1 else None
+    return opt, arg
 
-def open_browser():
-    """自动打开浏览器"""
-    time.sleep(1)
-    webbrowser.open('http://localhost:5000')
 
+def ask(prompt: str, default: Optional[str] = None) -> str:
+    if RICH:
+        return Prompt.ask(prompt, default=default)
+    sfx = f" [{default}]" if default is not None else ''
+    val = input(f"{prompt}{sfx}: ").strip()
+    return default if (val == '' and default is not None) else val
+
+
+def choose_url(arg_from_inline: Optional[str] = None) -> str:
+    url = arg_from_inline or ask('贴上视频 URL (https://hanime1.me/watch?v=数字)')
+    if not WATCH_RE.match(url):
+        raise ValueError('URL 不合法：需要形如 https://hanime1.me/watch?v=123456')
+    return url
+
+
+def choose_plan_path(arg_from_inline: Optional[str] = None) -> Path:
+    p = arg_from_inline or ask('输入计划文件路径 (plan.json)')
+    path = Path(p).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f'找不到文件：{path}')
+    return path
+
+
+def configure_settings():
+    if RICH:
+        console.print(Panel.fit("当前设置", style="hl"))
+        table = Table(show_header=False)
+        table.add_row("下载目录", f"{CFG.directory}")
+        table.add_row("失败重试", f"{CFG.retry}")
+        table.add_row("同线程延迟(秒)", f"{CFG.delay}")
+        table.add_row("任务错峰(秒)", f"{CFG.stagger}")
+        table.add_row("并发线程", f"{CFG.threads}")
+        table.add_row("画质优先级", f"{CFG.priority}")
+        table.add_row("标题策略", f"{CFG.title_mode}  (share_h3=统一原名, as_shown=页面显示)")
+        table.add_row("无头浏览器(headless)", "是" if CFG.headless else "否")
+        table.add_row("解析时加载图片", "是" if CFG.parse_with_images else "否")
+        console.print(table)
+    else:
+        c_info(f"下载目录: {CFG.directory}\n重试: {CFG.retry}  延迟: {CFG.delay}s  错峰: {CFG.stagger}s  线程: {CFG.threads}\n画质: {CFG.priority}  标题策略: {CFG.title_mode}  headless: {'是' if CFG.headless else '否'}  解析加载图片: {'是' if CFG.parse_with_images else '否'}")
+
+    d = ask('下载目录', str(CFG.directory))
+    with contextlib.suppress(Exception):
+        CFG.directory = Path(d).expanduser(); CFG.directory.mkdir(parents=True, exist_ok=True)
+
+    try:
+        CFG.retry = int(ask('失败重试次数', str(CFG.retry)))
+        CFG.delay = int(ask('同一线程文件间延迟(秒)', str(CFG.delay)))
+        CFG.stagger = float(ask('任务提交错峰(秒)', str(CFG.stagger)))
+        CFG.threads = max(1, int(ask('并发线程数(建议 1~5)', str(CFG.threads))))
+    except ValueError:
+        c_warn('数字输入无效，保持原值。')
+
+    pr = ask('画质优先级 (highest/balanced/fastest)', CFG.priority)
+    if pr in ('highest','balanced','fastest'):
+        CFG.priority = pr
+    else:
+        c_warn('画质优先级无效，保持原值。')
+
+    tm = ask('标题策略 (share_h3/as_shown)', CFG.title_mode)
+    if tm in ('share_h3','as_shown'):
+        CFG.title_mode = tm
+    else:
+        c_warn('标题策略无效，保持原值。')
+
+    hd = ask('启用无头浏览器(headless)? (Y/n)', 'Y').lower()
+    CFG.headless = hd not in ('n','no','0')
+
+    img = ask('解析阶段加载图片? (Y/n)', 'Y').lower()
+    CFG.parse_with_images = img not in ('n','no','0')
+
+
+def interactive_main():
+    banner()
+    while True:
+        try:
+            menu_table()
+            line = ask('输入编号（或一行速用：<编号> <URL/文件>）')
+            opt, arg = parse_choice_line(line)
+            if not opt:
+                c_warn('请输入 1-7 的数字。'); continue
+            if opt == 7:
+                console.print('[dim]Bye![/dim]'); return
+            elif opt == 6:
+                configure_settings(); continue
+            elif opt == 1:
+                url = choose_url(arg)
+                res = analyze_watch(url, priority=CFG.priority, headless=CFG.headless, images_enabled=CFG.parse_with_images)
+                if RICH:
+                    table = Table(title="解析结果", title_style="info")
+                    table.add_column('#', justify='right')
+                    table.add_column('当前', justify='center')
+                    table.add_column('系列', justify='center')
+                    table.add_column('画质', justify='center')
+                    table.add_column('标题(统一原名)')
+                    for i, v in enumerate(res.playlist, 1):
+                        table.add_row(str(i), '✓' if v.is_current else '', '✓' if v.is_same_series else '', v.best_quality or '', v.original_title or v.title)
+                    console.print(table)
+                else:
+                    print(f"\n{BOLD}标题{RESET}: {res.title or '-'}\n{BOLD}系列{RESET}: {res.series_name or '-'}\n{BOLD}条目{RESET}: {len(res.playlist)}\n")
+                    header = f"{'#':>3}  {'当前':^4}  {'系列':^4}  {'画质':^6}  标题"; print(header); print('-'*len(header))
+                    for i, v in enumerate(res.playlist, 1):
+                        cur = '✓' if v.is_current else ''; ser = '✓' if v.is_same_series else ''; q = v.best_quality or ''
+                        print(f"{i:>3}  {cur:^4}  {ser:^4}  {q:^6}  {v.original_title or v.title}")
+                want = Confirm.ask('保存为计划文件?', default=False) if RICH else (ask('保存为计划文件? (y/N)', 'N').lower() in ('y','yes','1'))
+                if want:
+                    path = Path(ask('保存文件名', 'plan.json')).expanduser()
+                    plan = {'analyze': {'url': res.url, 'title': res.title, 'series_name': res.series_name, 'timestamp': res.timestamp},
+                            'playlist': [asdict(p) for p in res.playlist]}
+                    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+                    c_ok(f'已保存：{path}')
+            elif opt in (2,3,4):
+                url = choose_url(arg)
+                res = analyze_watch(url, priority=CFG.priority, headless=CFG.headless, images_enabled=CFG.parse_with_images)
+                if opt == 2:
+                    items = [res.playlist[0]]
+                elif opt == 3:
+                    items = [x for x in res.playlist if x.is_same_series] or [res.playlist[0]]
+                else:
+                    items = list(res.playlist)
+                c_info(f"将下载 {len(items)} 个条目到：{CFG.directory}")
+                run_parallel_download(items)
+            elif opt == 5:
+                plan_path = choose_plan_path(arg)
+                data = json.loads(plan_path.read_text(encoding='utf-8'))
+                items = [VideoItem(**p) for p in data.get('playlist', [])]
+                c_info(f"从计划载入 {len(items)} 个条目 → {CFG.directory}")
+                choose = ask('直接全部下载? (Y/n)', 'Y').lower()
+                if choose in ('n','no','0'):
+                    print('输入要下载的编号（例：1,3,5），空回车默认全部：')
+                    sel = input('> ').strip()
+                    if sel:
+                        idxs=[]
+                        for part in re.split(r'[，,\s]+', sel):
+                            if not part: continue
+                            with contextlib.suppress(ValueError):
+                                idxs.append(int(part))
+                        items = [items[i-1] for i in idxs if 1<=i<=len(items)] or items
+                run_parallel_download(items)
+            else:
+                c_warn('请输入 1-7 的数字。')
+        except KeyboardInterrupt:
+            console.print('\n[dim]已取消，返回菜单[/dim]')
+        except Exception as e:
+            c_err(str(e))
+
+# ====================== 传统子命令 =======================
+
+def build_parser(prog_name: str) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=prog_name, description='视频批量下载器（交互式 + 多线程）')
+    p.add_argument('--headless', dest='headless', action='store_true', help='启用无头浏览器 (默认)')
+    p.add_argument('--no-headless', dest='headless', action='store_false', help='关闭无头，打开可视化调试')
+    p.set_defaults(headless=True)
+    p.add_argument('--threads', type=int, default=None, help='并发线程数，默认 3')
+    p.add_argument('--stagger', type=float, default=None, help='任务提交错峰秒数，默认 0.8')
+    p.add_argument('--dir', default=None, help='下载目录，默认 ~/Downloads/Videos')
+    p.add_argument('--priority', choices=['highest','balanced','fastest'], default='highest')
+    p.add_argument('--title-mode', choices=['share_h3','as_shown'], default=None, help='标题策略：share_h3=统一原名；as_shown=页面显示')
+    p.add_argument('--parse-images', dest='parse_images', action='store_true', help='解析阶段加载图片 (默认开)')
+    p.add_argument('--no-parse-images', dest='parse_images', action='store_false', help='解析阶段禁用图片加载')
+    p.set_defaults(parse_images=True)
+
+    sub = p.add_subparsers(dest='cmd')
+
+    pa = sub.add_parser('analyze', help='解析 watch 页面（仅查看）')
+    pa.add_argument('url', help='https://hanime1.me/watch?v=12345')
+    pa.add_argument('--json', action='store_true')
+    pa.add_argument('--save-plan', metavar='FILE')
+
+    pd = sub.add_parser('download', help='解析并下载（可选 all/series-only/ids）')
+    pd.add_argument('--url', help='watch 页面 URL（与 --plan 二选一）')
+    pd.add_argument('--plan', help='使用 analyze 保存的计划 JSON')
+    g = pd.add_mutually_exclusive_group()
+    g.add_argument('--all', action='store_true', help='下载播放列表全部')
+    g.add_argument('--series-only', action='store_true', help='仅下载同系列')
+    g.add_argument('--ids', help="按编号下载，如 '1,3,5'")
+    pd.add_argument('--delay', type=int, default=2, help='同线程连续文件延迟秒数（防风控）')
+    pd.add_argument('--retry', type=int, default=3, help='失败重试次数')
+    pd.add_argument('--json', action='store_true', help='结果 JSON 输出（仅汇总）')
+
+    return p
+
+
+def cli_main(argv: List[str]):
+    if len(argv) == 1:
+        interactive_main(); return
+
+    parser = build_parser(Path(argv[0]).name)
+    args = parser.parse_args(argv[1:])
+
+    CFG.headless = bool(getattr(args, 'headless', True))
+    CFG.parse_with_images = bool(getattr(args, 'parse_images', True))
+    if getattr(args, 'threads', None) is not None:
+        CFG.threads = max(1, args.threads)
+    if getattr(args, 'stagger', None) is not None:
+        CFG.stagger = max(0.0, float(args.stagger))
+    if getattr(args, 'dir', None):
+        CFG.directory = Path(args.dir).expanduser(); CFG.directory.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'priority', None):
+        CFG.priority = args.priority
+    if getattr(args, 'title_mode', None):
+        CFG.title_mode = args.title_mode
+
+    if args.cmd == 'analyze':
+        res = analyze_watch(args.url, priority=CFG.priority, headless=CFG.headless, images_enabled=CFG.parse_with_images)
+        if args.json:
+            print(json.dumps({'url':res.url,'title':res.title,'series_name':res.series_name,
+                              'playlist':[asdict(p) for p in res.playlist],'timestamp':res.timestamp}, ensure_ascii=False, indent=2))
+            return
+        if RICH:
+            tbl = Table(title="解析结果", title_style="info")
+            tbl.add_column('#', justify='right'); tbl.add_column('当前', justify='center'); tbl.add_column('系列', justify='center'); tbl.add_column('画质', justify='center'); tbl.add_column('标题(统一原名)')
+            for i, v in enumerate(res.playlist, 1):
+                tbl.add_row(str(i), '✓' if v.is_current else '', '✓' if v.is_same_series else '', v.best_quality or '', v.original_title or v.title)
+            console.print(tbl)
+        else:
+            print(f"\n{BOLD}标题{RESET}: {res.title or '-'}\n{BOLD}系列{RESET}: {res.series_name or '-'}\n{BOLD}条目{RESET}: {len(res.playlist)}\n")
+            header = f"{'#':>3}  {'当前':^4}  {'系列':^4}  {'画质':^6}  标题"; print(header); print('-'*len(header))
+            for i, v in enumerate(res.playlist, 1):
+                cur = '✓' if v.is_current else ''; ser = '✓' if v.is_same_series else ''; q = v.best_quality or ''
+                print(f"{i:>3}  {cur:^4}  {ser:^4}  {q:^6}  {v.original_title or v.title}")
+        if args.save_plan:
+            plan = {'analyze': {'url': res.url, 'title': res.title, 'series_name': res.series_name, 'timestamp': res.timestamp}, 'playlist': [asdict(p) for p in res.playlist]}
+            Path(args.save_plan).write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+            c_ok(f'已保存计划到 {args.save_plan}')
+        return
+
+    if args.cmd == 'download':
+        if args.plan and Path(args.plan).exists():
+            data = json.loads(Path(args.plan).read_text(encoding='utf-8'))
+            items = [VideoItem(**p) for p in data.get('playlist', [])]
+        elif args.url:
+            res = analyze_watch(args.url, priority=CFG.priority, headless=CFG.headless, images_enabled=CFG.parse_with_images)
+            if args.all:
+                items = list(res.playlist)
+            elif args.series_only:
+                items = [x for x in res.playlist if x.is_same_series] or [res.playlist[0]]
+            elif args.ids:
+                idxs = []
+                for part in re.split(r'[，,\s]+', args.ids.strip()):
+                    if not part: continue
+                    with contextlib.suppress(ValueError):
+                        idxs.append(int(part))
+                items = [res.playlist[i-1] for i in idxs if 1 <= i <= len(res.playlist)] or [res.playlist[0]]
+            else:
+                items = [res.playlist[0]]
+        else:
+            raise SystemExit('download 需要 --url 或 --plan')
+
+        CFG.delay = int(getattr(args, 'delay', CFG.delay))
+        CFG.retry = int(getattr(args, 'retry', CFG.retry))
+
+        run_parallel_download(items)
+        return
+
+    interactive_main()
+
+# ====================== 入口 =======================
 if __name__ == '__main__':
-    default_dir = Path.home() / 'Downloads' / 'Videos'
-    default_dir.mkdir(parents=True, exist_ok=True)
-    download_settings['download_dir'] = str(default_dir)
-    
-    print("=" * 70)
-    print(" " * 20 + "🎬 视频下载器 Pro")
-    print("=" * 70)
-    print("✨ 特性:")
-    print("  • 毛玻璃UI界面，极致视觉体验")
-    print("  • 单线程顺序下载，防止风控")
-    print("  • 自动重试机制，最多重试3次")
-    print("  • 静音爬取，后台悄无声息")
-    print("  • 保留原始文件名")
-    print("  • 自定义下载间隔和目录")
-    print("-" * 70)
-    print(f"📁 默认下载目录: {download_settings['download_dir']}")
-    print(f"⏱️ 默认下载间隔: {download_settings['download_delay']} 秒")
-    print(f"🔄 默认重试次数: {download_settings['retry_count']} 次")
-    print("-" * 70)
-    print("🌐 服务器地址: http://localhost:5000")
-    print("📌 按 Ctrl+C 停止服务器")
-    print("=" * 70)
-    
-    Timer(1.0, open_browser).start()
-    
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    with contextlib.suppress(Exception):
+        DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+    cli_main(sys.argv)
