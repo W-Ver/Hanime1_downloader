@@ -64,14 +64,14 @@ pip install -U requests selenium rich
 
 ```bash
 # 方式一：进入交互菜单（推荐）
-python hanime1_cli_交互式多线程高颜值版.py
+python hanime1_cli_hanime1下载器.py
 
 # 方式二：一行速用（无需进入菜单）
-python hanime1_cli_交互式多线程高颜值版.py 4 https://hanime1.me/watch?v=123456
+python hanime1_cli_hanime1下载器.py 4 https://hanime1.me/watch?v=123456
 
 # 方式三：传统子命令
-python hanime1_cli_交互式多线程高颜值版.py analyze "https://hanime1.me/watch?v=123456" --json
-python hanime1_cli_交互式多线程高颜值版.py download --url "https://hanime1.me/watch?v=123456" --all --threads 3
+python hanime1_cli_hanime1下载器.py analyze "https://hanime1.me/watch?v=123456" --json
+python hanime1_cli_hanime1下载器.py download --url "https://hanime1.me/watch?v=123456" --all --threads 3
 ```
 
 ---
@@ -94,10 +94,10 @@ python hanime1_cli_交互式多线程高颜值版.py download --url "https://han
 
 ```bash
 # 下载播放列表全部
-python hanime1_cli_交互式多线程高颜值版.py 4 https://hanime1.me/watch?v=97494
+python hanime1_cli_hanime1下载器.py 4 https://hanime1.me/watch?v=97494
 
 # 用计划文件下载
-python hanime1_cli_交互式多线程高颜值版.py 5 D:\plan.json
+python hanime1_cli_hanime1下载器.py 5 D:\plan.json
 ```
 
 ---
