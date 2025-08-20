@@ -80,6 +80,7 @@ python hanime1_cli_hanime1下载器.py download --url "https://hanime1.me/watch?
 ## 交互式菜单
 
 运行后会显示一个表格菜单（`rich` 样式）。**你可以输入编号**，或**直接一行速用**（编号+链接/文件路径）：
+<img width="1978" height="863" alt="image" src="https://github.com/user-attachments/assets/48b50f52-cca3-4033-b96c-3589d05c242d" />
 
 * 1 解析页面（仅查看）：展示标题/系列/画质；可**保存 plan.json**
 * 2 下载当前视频
